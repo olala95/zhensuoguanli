@@ -265,6 +265,16 @@ node tools/js_api_check.js
 python tools/inventory.py        # 输出 → %TEMP%/clinic_inventory.txt
 ```
 
+### 发布到 GitHub
+
+```
+python tools/pre_publish_check.py   # 推送前自检（返回非 0 就不要推）
+python tools/repo_status.py         # 看分支 / commit / 远程 / 未提交改动
+```
+
+**绝不能入库**：`data/`（含患者数据）、`backups/`、`logs/`、`.workbuddy/`、`*.db*`。
+已在 `.gitignore` 中，**不要 `git add -f` 强加**。详见 `CONTRIBUTING.md`。
+
 三方对账：功能文档 `Mxx_*/F*.md` ↔ 源码里的 `F` 编号标记 ↔ 测试里的模块调用。
 判"测试有没有覆盖"时**按模块函数在测试中被调用**来判，而不是找 F 编号文字——
 多数测试直接调服务函数、不会写编号注释，按文字找会产生大量误报。
