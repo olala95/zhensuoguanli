@@ -92,8 +92,8 @@ def main():
         check("管理员登录", code == 200 and bool(r["data"]["token"]))
         token = r["data"]["token"]
 
-        # 给自己加医生角色，便于后续以医生身份操作
-        call("/api/system/user/roles", {"user_id": 1, "roles": ["ADMIN", "DOCTOR"]}, token=token)
+        # 初始化已给管理员分配 ADMIN/DOCTOR/PHARMACIST/CASHIER 四个角色
+        # （单机单用户一人兼多职），这里直接以医生身份登录即可。
         code, r = call("/api/auth/login", {"username": "admin", "password": "Clinic@2026",
                                            "role_code": "DOCTOR"})
         dtoken = r["data"]["token"]
@@ -220,11 +220,33 @@ def main():
         code, r = call("/api/ai/risk/check", {"patient_id": pid}, token=dtoken)
         check("AI 风险提醒接口", code == 200 and isinstance(r["data"]["alerts"], list))
 
+        # ---------- 越权用例专用账号 ----------
+        # 重要：权限按账号「全部角色的并集」计算（单机单用户，一人兼多职）。
+        # admin 拥有 4 个角色，因此不能用 admin 来验证"医生不能发药"这类角色隔离——
+        # 必须新建**只有单一角色**的账号，否则测的是 admin 而不是角色边界。
+        def _mk_single_role(uname, role):
+            call("/api/system/user/create", {"username": uname, "display_name": uname,
+                                             "password": "Clinic@2026", "roles": [role]},
+                 token=token)
+            _, rr = call("/api/auth/login", {"username": uname, "password": "Clinic@2026",
+                                             "role_code": role})
+            return rr["data"]["token"]
+
+        doc_only = _mk_single_role("only_doctor", "DOCTOR")
+        ph_only = _mk_single_role("only_pharm", "PHARMACIST")
+        cash_only = _mk_single_role("only_cashier", "CASHIER")
+
+        # 反证：admin 是多角色账号，权限并集必须覆盖全流程
+        _, rr = call("/api/auth/login", {"username": "admin", "password": "Clinic@2026",
+                                         "role_code": "ADMIN"})
+        admin_perms = set(rr["data"].get("permissions") or [])
+        need = {"patient.create", "record.edit", "prescription.create", "bill.pay",
+                "dispense.do", "print.create", "system.config"}
+        check("多角色账号权限并集覆盖完整流程", need <= admin_perms,
+              "缺少 %s" % sorted(need - admin_perms))
+
         # ---------- 第三阶段：M07 药房（HTTP）----------
         expiry = (datetime.date.today() + datetime.timedelta(days=365)).isoformat()
-        call("/api/system/user/roles", {"user_id": 1,
-                                        "roles": ["ADMIN", "DOCTOR", "PHARMACIST", "CASHIER"]},
-             token=token)
         code, r = call("/api/auth/login", {"username": "admin", "password": "Clinic@2026",
                                            "role_code": "PHARMACIST"})
         phtoken = r["data"]["token"]
@@ -249,8 +271,8 @@ def main():
         check("入库后可用量 50", code == 200 and r["data"]["available"] == 50,
               str(r.get("data", {}).get("available")))
 
-        code, r = call("/api/pharmacy/dispense", {"prescription_id": hxid}, token=dtoken)
-        check("医生无发药权限（perm=dispense.do）", code == 403,
+        code, r = call("/api/pharmacy/dispense", {"prescription_id": hxid}, token=doc_only)
+        check("单角色医生无发药权限（perm=dispense.do）", code == 403,
               r.get("error", {}).get("code", ""))
 
         code, r = call("/api/pharmacy/dispense", {"prescription_id": rxid}, token=phtoken)
@@ -327,15 +349,8 @@ def main():
               r.get("error", {}).get("code", ""))
 
         # 权限：药师不能开方
-        call("/api/system/user/roles", {"user_id": 1,
-                                        "roles": ["ADMIN", "DOCTOR", "PHARMACIST"]}, token=token)
-        code, r = call("/api/auth/login", {"username": "admin", "password": "Clinic@2026",
-                                           "role_code": "PHARMACIST"})
-        ptoken = r["data"]["token"]
-        code, r = call("/api/prescription/create", {"visit_id": vid}, token=ptoken)
-        check("药师不能开处方", code == 403, r.get("error", {}).get("code", ""))
-        call("/api/system/user/roles", {"user_id": 1, "roles": ["ADMIN", "DOCTOR", "CASHIER"]},
-             token=token)
+        code, r = call("/api/prescription/create", {"visit_id": vid}, token=ph_only)
+        check("单角色药师不能开处方", code == 403, r.get("error", {}).get("code", ""))
 
         code, r = call("/api/visit/complete", {"visit_id": vid}, token=dtoken)
         check("完成就诊", code == 200 and r["data"]["to"] == "COMPLETED")
@@ -367,8 +382,8 @@ def main():
                        method="GET", token=dtoken)
         check("患者与疾病谱报表", code == 200 and "disease_top_west" in r["data"])
         code, r = call("/api/report/export", {"kind": "revenue", "from": today, "to": today},
-                       token=dtoken)
-        check("医生无导出权限（report.export）", code == 403,
+                       token=doc_only)
+        check("单角色医生无导出权限（report.export）", code == 403,
               r.get("error", {}).get("code", ""))
         code, r = call("/api/report/export", {"kind": "revenue", "from": today, "to": today},
                        token=token)
@@ -381,15 +396,10 @@ def main():
                        method="GET", token=dtoken)
         check("报表区间过大被拒", code == 400, r.get("error", {}).get("code", ""))
 
-        # 权限：收费员角色不能写病历
-        call("/api/system/user/roles", {"user_id": 1, "roles": ["ADMIN", "DOCTOR", "CASHIER"]},
-             token=token)
-        code, r = call("/api/auth/login", {"username": "admin", "password": "Clinic@2026",
-                                           "role_code": "CASHIER"})
-        ctoken = r["data"]["token"]
+        # 权限：单角色收费员不能写病历
         code, r = call("/api/record/save/chief", {"record_id": rid, "content": "改内容"},
-                       token=ctoken)
-        check("越权写病历被拒绝", code == 403, r.get("error", {}).get("code", ""))
+                       token=cash_only)
+        check("单角色收费员越权写病历被拒绝", code == 403, r.get("error", {}).get("code", ""))
         code, r = call("/api/audit/permission", {"limit": 10}, method="GET", token=token)
         check("越权写入审计", code == 200 and len(r["data"]["items"]) >= 1)
 

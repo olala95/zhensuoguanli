@@ -105,10 +105,27 @@ class Browser:
         self.ws = WS(page["webSocketDebuggerUrl"])
         self.id = 0
         self.events = []
+        self.prompts = []      # 已弹出的 confirm/prompt 记录
+        self.answers = []      # 预置的 prompt 应答队列（按调用顺序）
+        self.dialogs = []      # 自动应答明细
         self.send("Page.enable")
         self.send("Runtime.enable")
         self.send("Log.enable")
         self.send("Network.enable")
+
+    def _auto_dialog(self, ev):
+        """页面弹 prompt/confirm/alert 时必须立刻应答，否则整个渲染进程挂住。"""
+        p = ev.get("params", {})
+        dtype = p.get("type")
+        msg = p.get("message", "")
+        answer = ""
+        if dtype == "prompt":
+            answer = self.answers.pop(0) if self.answers else ""
+        self.dialogs.append({"type": dtype, "message": msg, "answer": answer})
+        self.id += 1
+        # 不等待响应：这一帧必须立刻回去，否则调用方永远等不到自己的 id
+        self.ws.send({"id": self.id, "method": "Page.handleJavaScriptDialog",
+                      "params": {"accept": True, "promptText": answer}})
 
     def send(self, method, params=None):
         self.id += 1
@@ -120,6 +137,9 @@ class Browser:
                 if "error" in msg:
                     raise RuntimeError("%s -> %s" % (method, msg["error"]))
                 return msg.get("result", {})
+            if msg.get("method") == "Page.javascriptDialogOpening":
+                self._auto_dialog(msg)
+                continue
             self.events.append(msg)
             if len(self.events) > 4000:
                 self.events = self.events[-2000:]
@@ -128,9 +148,13 @@ class Browser:
         end = time.time() + seconds
         while time.time() < end:
             try:
-                self.events.append(self.ws.recv(1))
+                ev = self.ws.recv(1)
             except Exception:
                 break
+            if ev.get("method") == "Page.javascriptDialogOpening":
+                self._auto_dialog(ev)
+                continue
+            self.events.append(ev)
 
     def goto(self, url, wait=1.6):
         self.send("Page.navigate", {"url": url})

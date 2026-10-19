@@ -18,6 +18,9 @@ from core.errors import require, require_keys, AppError, conflict, not_found
 
 APP_VERSION = "1.0.0"
 
+# 首装时授予管理员的角色：单机单用户，一人兼多职。
+INIT_ADMIN_ROLES = ("ADMIN", "DOCTOR", "PHARMACIST", "CASHIER")
+
 # 各数据类型对应的目标表与所属模块（F128）
 IMPORT_TARGETS = {
     "ICD10":        ("sys_dict", "M14"),
@@ -79,8 +82,13 @@ def init_system(ctx, body, q):
               security.hash_password(body["admin_password"], salt), salt,
               tu.now_str(), tu.now_str(), 0, tu.now_str(), 0))
         uid = cur.lastrowid
-        db.execute(conn, "INSERT INTO sys_user_role (user_id, role_code, created_at, created_by) "
-                         "VALUES (?,'ADMIN',?,0)", (uid, tu.now_str()))
+        # 单机单用户：一台电脑一名操作员，一人兼医生/药师/收费员/管理员。
+        # 初始化必须把这四个角色都给管理员，否则新装系统第一次登录
+        # 建档、写病历、开方、收费、发药全部报 E6002（"账号无权执行"），
+        # 直接表现为"装好了但什么都干不了"。
+        for role_code in INIT_ADMIN_ROLES:
+            db.execute(conn, "INSERT INTO sys_user_role (user_id, role_code, created_at, "
+                             "created_by) VALUES (?,?,?,0)", (uid, role_code, tu.now_str()))
         if body.get("clinic_name"):
             db.execute(conn, "UPDATE sys_config SET cfg_value=?, updated_at=? WHERE cfg_key='clinic.name'",
                        (body["clinic_name"], tu.now_str()))

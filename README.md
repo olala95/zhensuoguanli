@@ -37,6 +37,25 @@ Windows 用户也可以直接**双击 `start.bat`**（会自动找可用的 Pyth
 首次启动会走**初始化向导**，让你设诊所名与管理员账号。
 数据库自动建在 `data/clinic.db`（已在 `.gitignore` 中，不会提交）。
 
+### 账号与权限（单机单用户）
+
+初始化创建的管理员**同时被授予 医生 / 药师 / 收费员 / 管理员 四个角色**，
+因为一台电脑就是一个操作员，一个人要干完全部岗位。
+
+- **能做什么** = 该账号被授予的所有角色的权限**并集**
+- 登录页那个「本次以什么身份操作」**只影响审计记录**，不限制功能
+- 审计表里记录的是**实际行使的角色**（例如以医生身份开的方，审计记 DOCTOR）
+
+如果你需要严格分权（如护士只能录病历、不能收费），在「系统管理 → 用户与角色」
+里建只带单一角色的账号即可，越权会被拒绝并留痕。
+
+### 只允许一个实例
+
+端口被占用时新进程会**直接拒绝启动**并提示「系统已经在运行」，
+避免两个实例同时写同一个数据库（Windows 默认允许端口复用，
+早期版本会出现请求随机落到旧进程、一会儿正常一会儿报错）。
+重复双击 `start.bat` 只会帮你打开已运行的那个。
+
 其他常用参数：
 
 ```bash
@@ -102,6 +121,7 @@ M01_..M15_/        每个模块的 MODULE.md / Fxx.md / ACCEPTANCE.md
 # 单元 / 集成
 python tests/smoke_test.py
 python tests/http_smoke.py
+python tests/first_run_test.py     # 全新库首装 → 立刻走完整门诊（防"装好了不能用"）
 python tests/phase3_test.py
 python tests/final_acceptance_test.py
 
@@ -111,10 +131,13 @@ python tools/run_fresh_full.py
 # 前端契约：前端调用的每个接口后端都得接得住
 python tests/api_contract_test.py
 node   tools/js_api_check.js         # 需要 Node，验证前端 api() 的 GET/POST 行为
+
+# 真实浏览器点一遍（需要 Edge 开 --remote-debugging-port=9222）
+python tools/ui_e2e.py
 ```
 
-当前基线：**12 个测试文件全部通过；功能点全量验收 206 项通过 0 失败**
-（5 项按业务不适用跳过，见 `tools/fn_full_test.py` 内注释）。
+当前基线：**13 个测试文件全部通过；功能点全量验收 206 项通过 0 失败**；
+`tools/ui_e2e.py` 53 项界面点击全通过（含 0 个失败请求、0 控制台报错）。
 
 ### 辅助工具
 
@@ -122,10 +145,15 @@ node   tools/js_api_check.js         # 需要 Node，验证前端 api() 的 GET/
 |---|---|
 | `tools/fn_full_test.py` | 230 个接口逐个执行并验证业务结果 |
 | `tools/run_fresh_full.py` | 在全新临时库上跑全量验收，排除历史数据干扰 |
-| `tools/ui_flow_test.py` | 端到端主链路：建档 → 日结 |
+| `tools/ui_e2e.py` | **真实浏览器点完整流程**（建档→接诊→病历→开方→收费→发药→打印→完成） |
+| `tools/cdp.py` | 标准库实现的浏览器调试客户端，供 ui_e2e/ui_walk 使用 |
+| `tools/ui_walk.py` | 逐页渲染 + 控制台错误 + 截图 |
+| `tools/ui_flow_test.py` | 端到端主链路（直接打接口，不走界面） |
 | `tools/ui_probe.py` | 各页面首屏依赖的接口链 |
 | `tools/ui_click_audit.py` | 扫描"点了没反应"的按钮（缺 try/catch） |
 | `tools/api_audit.py` | 前后端接口对账（路径 / HTTP 方法 / 接入度） |
+| `tools/db_slim.py` | 审计表归档瘦身（先导出 gzip 再从主库移出） |
+| `tools/backup_cleanup.py` | 备份目录清理（默认只列清单） |
 | `tools/inventory.py` | 功能点三方对账（文档 ↔ 实现 ↔ 测试） |
 | `tools/dump_routes.py` | 导出路由清单 |
 
@@ -134,6 +162,38 @@ node   tools/js_api_check.js         # 需要 Node，验证前端 api() 的 GET/
 ```bash
 export CLINIC_PWD='your-password'    # Windows: set CLINIC_PWD=...
 ```
+
+---
+
+## 日常使用要点
+
+### 一次门诊的标准动作
+
+1. 工作台「+ 新建患者」→ 自动挂号
+2. 点该患者行的「接诊」→ 进入病历
+3. 填主诉 / 现病史 / 中医四诊 / 辨证 / 诊断 →「保存全部」→「确认签名」（输口令）
+4. 「开方」→ 选就诊 → 选成药/饮片/颗粒 →「建方」→ 搜药加明细 →「保存明细」→「提交」→「确认」
+5. 「收费」→ 选就诊 →「生成账单」→ 填金额收款
+6. 「药房库存」→ 选就诊 → 选处方 →「中药发药 / 成药发药」
+7. 「打印硬件」→ 选就诊 → 选处方 →「打处方笺」；在任务行点「打印」用系统打印机出纸
+8. 工作台「完成」
+
+**所有单据都从下拉里选，不需要记任何 ID。**
+
+### 日结
+
+日结后当天账单锁定，只能红字冲正。**误点日结可以用「撤销今日日结」恢复**
+（仅限当天、只能撤最近一次、须填原因并写高风险审计）。
+
+### 审计表会变大
+
+审计只允许 INSERT、不可改不可删。行数多了启动自检会提示，
+用 `python tools/db_slim.py` 先归档成 gzip 再从主库移出（会先做安全备份）。
+
+### 备份
+
+备份目录会累积。`python tools/backup_cleanup.py` 先看清单，
+确认后加 `--apply` 清理（保留最近 5 份 + 每月 1 份）。
 
 ---
 

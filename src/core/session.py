@@ -98,6 +98,53 @@ def has_permission(role_code, permission):
     return permission in ROLE_PERMISSIONS.get(role_code, set())
 
 
+def user_roles(user_id):
+    """该账号被授予的全部角色（未删除的）。"""
+    if not user_id:
+        return []
+    try:
+        rows = db.query("SELECT role_code FROM sys_user_role "
+                        "WHERE user_id=? AND deleted_at IS NULL ORDER BY id", (user_id,))
+    except Exception:
+        return []
+    return [r["role_code"] for r in rows]
+
+
+def user_permissions(user_id):
+    """账号权限 = 其全部角色的并集。
+
+    为什么必须取并集（而不是登录时选定的单一角色）：
+      本系统是**单机单用户**，一台电脑一名操作员，一人兼任医生/药师/收费员/管理员。
+      早期实现按会话里那个单一 role_code 校验，导致选「医生」就收不了费、发不了药，
+      选「管理员」就连建档/写病历都被拒 —— 无论选哪个角色都走不完一次完整门诊。
+      「登录角色」只决定**审计默认身份**，不决定能不能干这个活。
+    """
+    perms = set()
+    for rc in user_roles(user_id):
+        perms |= ROLE_PERMISSIONS.get(rc, set())
+    return perms
+
+
+def acting_role(user_id, preferred_role, permission):
+    """返回行使该权限的角色：优先用登录时选的身份，否则用真正有权的那个角色。
+
+    审计要记录"以什么身份操作"。如果当前身份没这项权限、靠另一个角色才做得了，
+    就应当记录那个真正行使职责的角色，而不是记一个无权角色。
+    """
+    if permission is None:
+        return preferred_role
+    if has_permission(preferred_role, permission):
+        return preferred_role
+    for rc in user_roles(user_id):
+        if has_permission(rc, permission):
+            return rc
+    return preferred_role
+
+
+def has_permission_for_user(user_id, permission):
+    return permission in user_permissions(user_id)
+
+
 def _idle_timeout():
     return config.get_int("session.idle_timeout", 900)
 
@@ -180,7 +227,10 @@ def login(username, password, role_code, client_info=None):
             "username": username,
             "display_name": row["display_name"],
             "role_code": role_code,
-            "permissions": sorted(ROLE_PERMISSIONS.get(role_code, set())),
+            "roles": user_roles(row["id"]),
+            # 权限按该账号全部角色取并集：单机单用户下一人兼多职，
+            # 否则选「医生」就收不了费、选「管理员」就建不了档。
+            "permissions": sorted(user_permissions(row["id"])),
             "expires_at": expires,
         }
 

@@ -62,10 +62,29 @@ function go(hash) { location.hash = hash; }
 function fmtTime(t) { return t ? String(t).slice(5, 16) : '-'; }
 function statusTag(s) {
   const map = {
+    // 就诊 / 病历
     WAITING: ['muted', '候诊'], IN_PROGRESS: ['ok', '接诊中'], SUSPENDED: ['warn', '挂单'],
     COMPLETED: ['ok', '已完成'], VOID: ['danger', '已作废'],
     DRAFT: ['muted', '草稿'], CONFIRMED: ['ok', '已确认'], ARCHIVED: ['ok', '已归档'],
     SEALED: ['warn', '已封存'], UNSEALED: ['danger', '已解封'],
+    CLOSED: ['ok', '已结案'],
+    // 检验
+    ORDERED: ['warn', '已开单'], SAMPLED: ['warn', '已采样'], DELIVERED: ['warn', '已送检'],
+    REPORTED: ['ok', '已回报'], REVIEWED: ['ok', '已阅片'], CANCELLED: ['muted', '已取消'],
+    // 处方
+    PENDING: ['warn', '待确认'], DISPENSED: ['ok', '已发药'],
+    PARTIAL_RETURNED: ['warn', '部分退药'], FULLY_RETURNED: ['danger', '已退药'],
+    REJECTED: ['danger', '已驳回'],
+    // 账单 / 收款
+    UNPAID: ['warn', '待收费'], PAID: ['ok', '已收费'],
+    PARTIAL_REFUNDED: ['warn', '部分退款'], FULLY_REFUNDED: ['danger', '已全退'],
+    // 打印
+    SUCCESS: ['ok', '成功'], FAILED: ['danger', '失败'], RETRYING: ['warn', '重试中'],
+    ABANDONED: ['danger', '已放弃'], PRINTING: ['warn', '打印中'],
+    // 处置
+    EXECUTING: ['ok', '执行中'], FINISHED: ['ok', '已完成'], INTERRUPTED: ['warn', '已中断'],
+    // 通用
+    OPEN: ['warn', '待处理'], RESOLVED: ['ok', '已处理'], IGNORED: ['muted', '已忽略'],
   };
   const m = map[s] || ['muted', s];
   return `<span class="tag ${m[0]}">${m[1]}</span>`;
@@ -99,15 +118,17 @@ async function doInit() {
 }
 
 function viewLogin() {
+  const roles = (S.user && S.user.roles) || null;
   return `<div class="login-wrap"><div class="card">
     <h2>${esc((S.sys && S.sys.clinic_name) || '中医诊所')} 门诊系统</h2>
     <div class="row"><div style="flex:1"><label>用户名</label><input id="u" autofocus></div></div>
     <div class="row"><div style="flex:1"><label>口令</label><input id="p" type="password"></div></div>
-    <div class="row"><div style="flex:1"><label>登录角色</label>
+    <div class="row"><div style="flex:1"><label>本次以什么身份操作（仅影响审计记录）</label>
       <select id="r"><option value="DOCTOR">医生</option><option value="PHARMACIST">药师</option>
       <option value="CASHIER">收费员</option><option value="ADMIN">管理员</option></select></div></div>
     <div class="row"><button class="btn" style="flex:1" onclick="doLogin()">登录</button></div>
-    <div class="hint">单机单用户场景下一人可兼任多角色，但审计会区分"以什么身份操作"。</div>
+    <div class="hint">单机单用户场景下一人可兼任多角色。<b>能做什么由账号被授予的全部角色决定</b>，
+      这里选的只是审计里记录的"以什么身份操作"，不会限制功能。</div>
   </div></div>`;
 }
 async function doLogin() {
@@ -451,6 +472,8 @@ async function startVisit(id) {
 }
 
 /* ---------- 接诊工作台 / 病历 ---------- */
+let LAST_RECORD_ID = 0;
+
 async function viewRecord(visitId) {
   let v, r;
   try {
@@ -471,6 +494,10 @@ async function viewRecord(visitId) {
     r = await api('/api/record/get', { id: c.id }, 'GET');
   }
   const rid = r.id;
+  // 记下当前病历 ID：归档区（arLoad）要的是 record_id，
+  // 而路由里的 #/record/<id> 是 visit_id，两者不是一回事，
+  // 混用会去查一个不存在的病历（控制台 404、归档信息空白）。
+  LAST_RECORD_ID = rid;
   const cc = r.chief_complaint || {}, pi = r.present_illness || {}, tf = r.tcm_four || {};
   const vit = (r.vitals && r.vitals[0]) || {};
   const locked = r.status !== 'DRAFT';
@@ -1000,22 +1027,21 @@ async function voidVisit(id) {
    M06 开方（F32-F39 / F110-F113）
    ============================================================ */
 const RX_STATE = { visitId: 0, rxId: 0, rx: null, drugs: [], herbs: [],
-                   drugKw: '', herbKw: '', check: null };
+                   drugKw: '', herbKw: '', check: null,
+                   rxType: 'WEST', doses: '7', decoction: '', admin: '' };
 
 async function viewPrescribe() {
-  let visits = [];
-  try { visits = (await api('/api/visit/list', { status: 'IN_PROGRESS', limit: 50 }, 'GET')).items || []; }
-  catch (e) { /* 权限或接口问题时忽略，允许手填就诊号 */ }
-  const opt = visits.map(v => `<option value="${v.id}" ${v.id == RX_STATE.visitId ? 'selected' : ''}>${esc(v.visit_no)} · ${esc(v.patient_name || '')}</option>`).join('');
+  try { await loadVisitChoices(); } catch (e) { }
   return `
   <div class="card">
     <h3>开方（M06）</h3>
     <div class="row">
-      <label style="width:96px">就诊</label>
-      <select id="rx_visit" style="flex:1" onchange="rxPickVisit()">
-        <option value="">— 选择进行中的就诊 —</option>${opt}
-      </select>
-      <input id="rx_visit_id" placeholder="或手填 visit_id" style="width:140px" value="${RX_STATE.visitId || ''}">
+      ${visitSelectHtml('rx_visit', {
+        selected: RX_STATE.visitId,
+        placeholder: '— 选择本次就诊 —',
+        status: ['WAITING', 'IN_PROGRESS', 'SUSPENDED'],
+        onchange: 'rxPickVisit()',
+      })}
       <button class="btn ghost sm" onclick="rxLoad()">载入</button>
     </div>
     <div id="rx_body"><div class="hint">选择就诊后载入该就诊的处方。</div></div>
@@ -1024,10 +1050,11 @@ async function viewPrescribe() {
 
 async function rxPickVisit() {
   RX_STATE.visitId = parseInt(val('rx_visit')) || 0;
+  if (!RX_STATE.visitId) { $('#rx_body').innerHTML = '<div class="hint">选择就诊后载入该就诊的处方。</div>'; return; }
   await rxLoad();
 }
 async function rxLoad() {
-  RX_STATE.visitId = parseInt(val('rx_visit_id') || val('rx_visit')) || 0;
+  RX_STATE.visitId = parseInt(val('rx_visit')) || RX_STATE.visitId || 0;
   if (!RX_STATE.visitId) { toast('请选择就诊', 'err'); return; }
   try {
     const v = await api('/api/visit/get', { id: RX_STATE.visitId }, 'GET');
@@ -1052,14 +1079,17 @@ async function rxLoad() {
       <div class="section-title" style="margin-top:12px">新建处方</div>
       ${rxCatalogForm()}
       <div class="row">
-        <select id="rx_type" style="width:140px" onchange="render()">
-          <option value="WEST">成药方</option><option value="HERB">饮片方</option>
-          <option value="GRANULE">颗粒方</option></select>
-        <input id="rx_doses" placeholder="付数（饮片）" style="width:110px" value="7">
-        <input id="rx_decoction" placeholder="煎法，如：水煎" style="flex:1">
-        <input id="rx_admin" placeholder="服法，如：每日一剂分两次温服" style="flex:1">
+        <select id="rx_type" style="width:150px" onchange="rxTypeChanged(this.value)">
+          <option value="WEST"${(RX_STATE.rxType || 'WEST') === 'WEST' ? ' selected' : ''}>成药方</option>
+          <option value="HERB"${RX_STATE.rxType === 'HERB' ? ' selected' : ''}>饮片方（中药）</option>
+          <option value="GRANULE"${RX_STATE.rxType === 'GRANULE' ? ' selected' : ''}>颗粒方</option></select>
+        <input id="rx_doses" placeholder="付数（饮片）" style="width:110px" value="${esc(RX_STATE.doses || '7')}">
+        <input id="rx_decoction" placeholder="煎法，如：水煎" style="flex:1" value="${esc(RX_STATE.decoction || '')}">
+        <input id="rx_admin" placeholder="服法，如：每日一剂分两次温服" style="flex:1" value="${esc(RX_STATE.admin || '')}">
         <button class="btn" onclick="rxCreate()">建方</button>
       </div>
+      <div class="hint" id="rx_type_hint">将创建：${RX_STATE.rxType === 'HERB' ? '<b>饮片方（中药）</b>'
+        : (RX_STATE.rxType === 'GRANULE' ? '<b>颗粒方</b>' : '<b>成药方</b>')}</div>
       <div class="section-title" style="margin-top:12px">本就诊处方（${list.length}）</div>
       <table class="tbl"><thead><tr><th>处方号</th><th>类型</th><th>状态</th><th>金额</th><th>操作</th></tr></thead>
       <tbody>${rows || '<tr><td colspan="5" class="hint">无</td></tr>'}</tbody></table>
@@ -1067,15 +1097,30 @@ async function rxLoad() {
   } catch (e) { toast(e.message, 'err'); }
 }
 
+function rxTypeChanged(v) {
+  RX_STATE.rxType = v;
+  const el = document.getElementById('rx_type_hint');
+  if (el) {
+    el.innerHTML = '将创建：' + (v === 'HERB' ? '<b>饮片方（中药）</b>'
+      : (v === 'GRANULE' ? '<b>颗粒方</b>' : '<b>成药方</b>'));
+  }
+}
+
 async function rxCreate() {
-  const t = val('rx_type') || 'WEST';
+  const t = val('rx_type') || RX_STATE.rxType || 'WEST';
+  RX_STATE.rxType = t;
+  // 建方后会重建表单，先把当前输入记住，避免付数/煎法/服法被重置
+  RX_STATE.doses = val('rx_doses');
+  RX_STATE.decoction = val('rx_decoction');
+  RX_STATE.admin = val('rx_admin');
   try {
     const r = await api('/api/prescription/create', {
       visit_id: RX_STATE.visitId, prescription_type: t,
       doses: t === 'WEST' ? null : (parseInt(val('rx_doses')) || 7),
       decoction_method: val('rx_decoction') || null,
       administration: val('rx_admin') || null });
-    toast('已建方 ' + r.prescription_no, 'ok');
+    toast('已建方 ' + r.prescription_no + '（' +
+      (t === 'HERB' ? '饮片方' : t === 'GRANULE' ? '颗粒方' : '成药方') + '）', 'ok');
     await rxLoad(); await rxOpen(r.id);
   } catch (e) { toast(e.message, 'err'); }
 }
@@ -1516,6 +1561,7 @@ async function viewPrint() {
       ${['FAILED'].includes(j.status) ? `<button class="btn sm ghost" onclick="prRetry(${j.id})">重试</button>` : ''}
       ${['FAILED', 'PENDING'].includes(j.status) ? `<button class="btn sm warn" onclick="prAbandon(${j.id})">放弃</button>` : ''}
       <button class="btn sm ghost" onclick="prDetail(${j.id})">详情</button>
+      <button class="btn sm ghost" onclick="prBrowserPrint(${j.id})">打印</button>
     </td></tr>`).join('');
   const devRows = devs.map(d => `<tr><td>${esc(d.device_name || d.driver_code)}</td><td>${esc(d.driver_code)}</td>
     <td>${statusTag(d.status)}</td><td>${esc(d.last_seen_at || '')}</td></tr>`).join('');
@@ -1598,7 +1644,39 @@ async function prExec(id) { try { await api('/api/print/job/execute', { job_id: 
 async function prReprint(id) { const r = prompt('重打原因：', '补打'); if (r === null) return; try { const x = await api('/api/print/job/reprint', { job_id: id, reason: r }); toast('已重打，单号不变：' + x.print_job_no, 'ok'); render(); } catch (e) { toast(e.message, 'err'); } }
 async function prRetry(id) { try { const x = await api('/api/print/job/retry', { job_id: id }); toast(x.abandoned ? '重试超限已放弃' : '重试成功', x.abandoned ? 'err' : 'ok'); render(); } catch (e) { toast(e.message, 'err'); } }
 async function prAbandon(id) { const r = prompt('放弃原因：', ' '); if (r === null) return; try { await api('/api/print/job/abandon', { job_id: id, reason: r }); toast('已放弃', 'ok'); render(); } catch (e) { toast(e.message, 'err'); } }
-async function prDetail(id) { try { const j = await api('/api/print/job/get', { id: id }, 'GET'); modal('打印任务 ' + j.print_job_no, `<pre style="white-space:pre-wrap;font-size:12px;max-height:400px;overflow:auto">${esc(j.rendered_text || '')}</pre>`); } catch (e) { toast(e.message, 'err'); } }
+async function prDetail(id) {
+  try {
+    const j = await api('/api/print/job/get', { id: id }, 'GET');
+    modal('打印任务 ' + j.print_job_no,
+      `<pre style="white-space:pre-wrap;font-size:12px;max-height:340px;overflow:auto">${esc(j.rendered_text || '')}</pre>
+       <div class="row" style="margin-top:8px">
+         <button class="btn sm" onclick="prBrowserPrint(${id})">用浏览器打印这一张</button>
+       </div>`);
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+/* 真实打印通道：把任务内容渲染成 A5 打印页，交给系统打印对话框。
+   硬件驱动目前只有 mock（落盘），这条路径不依赖任何特殊驱动，普通打印机即可。 */
+async function prBrowserPrint(id) {
+  try {
+    const j = await api('/api/print/job/get', { id: id }, 'GET');
+    const text = j.rendered_text || '';
+    if (!text) { toast('该任务没有可打印内容', 'err'); return; }
+    const w = window.open('', '_blank', 'width=820,height=920');
+    if (!w) { toast('浏览器拦截了弹窗，请允许弹窗后重试', 'err'); return; }
+    w.document.write('<!doctype html><html><head><meta charset="utf-8">'
+      + '<title>' + esc(j.print_job_no) + '</title>'
+      + '<style>body{font-family:"Microsoft YaHei","SimSun",monospace;padding:12mm;'
+      + 'font-size:13px;line-height:1.65;color:#000}'
+      + 'pre{white-space:pre-wrap;word-break:break-all;font-family:inherit;margin:0}'
+      + '@page{size:A5;margin:8mm}@media print{body{padding:0}}</style></head>'
+      + '<body><pre id="pp"></pre></body></html>');
+    w.document.getElementById('pp').textContent = text;
+    w.document.close();
+    w.focus();
+    setTimeout(() => { try { w.print(); } catch (e) { } }, 350);
+  } catch (e) { toast(e.message, 'err'); }
+}
 async function prHealth() { try { const r = await api('/api/hardware/health', {}, 'GET'); prMsg('自检：' + (r.items || []).map(i => esc(i.driver) + '=' + (i.online ? '在线' : '离线')).join('，')); } catch (e) { toast(e.message, 'err'); } }
 async function prScan() { try { const r = await api('/api/hardware/scan', {}); prMsg('扫码结果：' + esc(r.code || JSON.stringify(r))); } catch (e) { toast(e.message, 'err'); } }
 async function prIdCard() { try { const r = await api('/api/hardware/id_card/read', {}); prMsg('身份证：' + esc(r.name || '') + ' ' + esc(r.id_card_no || '')); } catch (e) { toast(e.message, 'err'); } }
@@ -2692,13 +2770,16 @@ async function viewBilling() {
 
   <div class="card">
     <h3>日结（F64）</h3>
-    <div class="row">
+    <div id="st_state" class="hint">读取今日日结状态…</div>
+    <div class="row" style="margin-top:6px">
       <input id="st_date" type="date" style="width:160px">
       <button class="btn sm" onclick="blSettle()">执行日结</button>
-      <span class="hint">日结后当日账单锁定，只能红字冲正</span>
+      <button class="btn sm ghost" onclick="blReopen()">撤销今日日结</button>
     </div>
+    <div class="hint">日结后当日账单锁定，只能红字冲正。<b>误点日结可用「撤销今日日结」恢复当天营业</b>（需填原因，写高风险审计）。</div>
     <table><thead><tr><th>日结号</th><th>营业日</th><th>实收</th><th>退款</th><th>净收</th><th>未收费</th></tr></thead>
-      <tbody>${settles.map(s => `<tr><td>${esc(s.settlement_no)}</td><td>${esc(s.biz_date)}</td>
+      <tbody>${settles.map(s => `<tr><td>${esc(s.settlement_no)}${s.voided_at ? '<span class="tag danger" style="margin-left:6px">已撤销</span>' : ''}</td>
+        <td>${esc(s.biz_date)}</td>
         <td>${esc(yuan(s.paid_amount_fen))}</td><td>${esc(yuan(s.refund_amount_fen))}</td>
         <td>${esc(yuan(s.net_amount_fen))}</td><td>${esc(s.pending_count)}</td></tr>`).join('')
     || '<tr><td class="empty" colspan="6">暂无日结记录</td></tr>'}</tbody></table>
@@ -2932,6 +3013,10 @@ async function blReversal() {
 }
 
 async function blSettle() {
+  const d = val('st_date') || today();
+  if (!confirm('确认对营业日 ' + d + ' 执行日结？\n\n'
+    + '日结后当天将不能再生成账单和收费，只能做红字冲正。\n'
+    + '如果点错了，可以用「撤销今日日结」恢复（仅限当天）。')) return;
   try {
     const body = {};
     if (val('st_date')) body.biz_date = val('st_date');
@@ -2939,6 +3024,30 @@ async function blSettle() {
     toast('日结完成：' + s.settlement_no + '，净收 ' + yuan(s.net_amount_fen) + ' 元', 'ok');
     render();
   } catch (e) { toast(e.message, 'err'); }
+}
+
+async function blReopen() {
+  const reason = prompt('撤销今日日结的原因（至少 4 个字，会写高风险审计）：', '日结误操作，恢复当天收费');
+  if (reason === null) return;
+  if (reason.trim().length < 4) { toast('原因至少 4 个字', 'err'); return; }
+  try {
+    const r = await api('/api/settlement/reopen', { reason: reason.trim() });
+    toast('已撤销 ' + r.settlement_no + '，解锁 ' + r.unlocked_bills + ' 张账单', 'ok');
+    render();
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+async function blLoadSettleState() {
+  const el = document.getElementById('st_state');
+  if (!el) return;
+  try {
+    const s = await api('/api/settlement/today', {}, 'GET');
+    el.innerHTML = s.settled
+      ? `<span class="tag warn">今日已日结</span> ${esc(s.settlement.settlement_no)}
+         · 净收 ${esc(yuan(s.settlement.net_amount_fen))} 元
+         —— 当日账单已锁定，不能再建账单/收费；如需继续营业请点「撤销今日日结」`
+      : '<span class="tag ok">今日未日结</span> —— 可以正常建账单与收费';
+  } catch (e) { el.textContent = ''; }
 }
 
 async function blQuery() {
@@ -3118,21 +3227,35 @@ async function rpPrint() {
 }
 
 /* ---------- 路由与渲染 ---------- */
+/* 菜单按权限过滤：没权限的入口不显示，避免"菜单都在、点了报无权限" */
+function can(perm) {
+  const p = (S.user && S.user.permissions) || [];
+  if (!p.length) return true;      // 老会话没有 permissions 字段，放行由后端兜底
+  return p.indexOf(perm) >= 0;
+}
+
 function layout(inner) {
   const u = S.user || {};
-  const navs = [
-    ['#/workbench', '工作台'], ['#/prescribe', '开方'],
-    ['#/lab', '检验检查'], ['#/pharmacy', '药房库存'],
-    ['#/treatment', '处置执行'], ['#/billing', '收费财务'],
-    ['#/print', '打印硬件'], ['#/ai', 'AI 语音'],
-    ['#/report', '经营统计'], ['#/system', '系统管理'],
+  const all = [
+    ['#/workbench', '工作台', 'visit.view'],
+    ['#/prescribe', '开方', 'prescription.view'],
+    ['#/lab', '检验检查', 'lab.view'],
+    ['#/pharmacy', '药房库存', 'stock.view'],
+    ['#/treatment', '处置执行', 'treatment.view'],
+    ['#/billing', '收费财务', 'finance.view'],
+    ['#/print', '打印硬件', 'print.view'],
+    ['#/ai', 'AI 语音', 'ai.view'],
+    ['#/report', '经营统计', 'report.view'],
+    ['#/system', '系统管理', 'system.config'],
   ];
+  const navs = all.filter(n => can(n[2]));
+  const roles = (u.roles && u.roles.length) ? u.roles.join('/') : (u.role_code || '');
   return `
   <div class="topbar">
     <span class="clinic">${esc((S.sys && S.sys.clinic_name) || '中医诊所')}</span>
     <span class="hint">门诊管理系统</span>
     <span class="spacer"></span>
-    <span class="who">${esc(u.display_name || '')} · ${esc(u.role_code || '')}</span>
+    <span class="who" title="账号被授予的全部角色">${esc(u.display_name || '')} · ${esc(roles)}</span>
     <button class="btn sm ghost" onclick="doLock()">锁屏</button>
     <button class="btn sm ghost" onclick="doLogout()">退出</button>
   </div>
@@ -3183,6 +3306,7 @@ async function render() {
     } else if (hash.startsWith('#/billing')) {
       const vid = parseInt((hash.split('/')[2] || '').split('?')[0]) || 0;
       app.innerHTML = layout(await viewBilling());
+      await blLoadSettleState();
       if (vid) { const el = document.getElementById('bl_visit'); if (el) el.value = vid; await blAuto(vid); }
     } else if (hash === '#/report') {
       app.innerHTML = layout(viewReport());
@@ -3190,7 +3314,8 @@ async function render() {
     } else if (hash.startsWith('#/record/')) {
       const id = hash.split('/')[2];
       app.innerHTML = layout(await viewRecord(id));
-      await arLoad(id);
+      // 用病历 ID（不是路由里的就诊 ID）加载归档区
+      if (LAST_RECORD_ID) await arLoad(LAST_RECORD_ID);
     } else {
       app.innerHTML = layout(await viewWorkbench());
     }

@@ -90,6 +90,7 @@ def _dispatch(handler, method, path, query, body):
                        retryable=False, http_status=404)
 
     token = _token(handler, query)
+    srow = None
     if meta["public"] and not token:
         ctx = Context(source="UI", client_info={"ua": handler.headers.get("User-Agent", "")})
     else:
@@ -106,24 +107,34 @@ def _dispatch(handler, method, path, query, body):
     set_ctx(ctx)
 
     # 权限校验（03 §9：越权拒绝并留痕）
+    # 判定用「账号全部角色的并集」：单机单用户下一人兼多职，
+    # 登录时选的角色只决定审计默认身份，不限制实际能做的操作。
     if meta["perm"] and not meta["public"]:
-        if not sess.has_permission(ctx.role_code, meta["perm"]):
+        if not sess.has_permission_for_user(ctx.user_id, meta["perm"]):
             try:
                 with db.tx() as conn:
                     audit.audit_permission(conn, meta["perm"], path, meta["action"])
             except Exception:
                 log.exception("写权限审计失败")
-            raise AppError("E6002", "当前角色（%s）无权执行：%s" % (ctx.role_code, meta["perm"]),
+            raise AppError("E6002", "当前账号（%s）无权执行：%s" % (ctx.username or ctx.user_id,
+                                                             meta["perm"]),
                            retryable=False, http_status=403)
-    if meta["roles"] and ctx.role_code not in meta["roles"]:
-        try:
-            with db.tx() as conn:
-                audit.audit_permission(conn, "role:%s" % ",".join(sorted(meta["roles"])),
-                                       path, meta["action"])
-        except Exception:
-            log.exception("写权限审计失败")
-        raise AppError("E6002", "当前角色（%s）无权访问该接口" % ctx.role_code,
-                       retryable=False, http_status=403)
+        # 审计记「实际行使的角色」：若登录身份无此权限、由另一角色完成，
+        # 就记为那个有权角色，避免审计里出现"无权角色干了这件事"的假记录。
+        ctx.role_code = sess.acting_role(srow["user_id"], srow["role_code"], meta["perm"])
+    if meta["roles"] and srow is not None:
+        allowed = set(meta["roles"])
+        if srow["role_code"] not in allowed and \
+                not any(rc in allowed for rc in sess.user_roles(srow["user_id"])):
+            try:
+                with db.tx() as conn:
+                    audit.audit_permission(conn, "role:%s" % ",".join(sorted(meta["roles"])),
+                                           path, meta["action"])
+            except Exception:
+                log.exception("写权限审计失败")
+            raise AppError("E6002", "当前账号无权访问该接口（需要角色 %s）"
+                           % ",".join(sorted(meta["roles"])),
+                           retryable=False, http_status=403)
 
     result = meta["fn"](ctx, body or {}, query)
 
@@ -204,6 +215,13 @@ class Handler(BaseHTTPRequestHandler):
     def _static(self, path):
         if path == "/":
             path = "/index.html"
+        # 浏览器会无条件请求 /favicon.ico；没有就返回 204，
+        # 否则控制台永远挂着一条红色 404，看着像系统出错。
+        if path == "/favicon.ico":
+            self.send_response(204)
+            self.send_header("Cache-Control", "public, max-age=86400")
+            self.end_headers()
+            return
         rel = path.lstrip("/")
         full = os.path.normpath(os.path.join(WEB_DIR, rel))
         if not os.path.abspath(full).startswith(os.path.abspath(WEB_DIR)) or \
@@ -248,8 +266,37 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
 
+class _ExclusiveServer(ThreadingHTTPServer):
+    """单实例 HTTP 服务。
+
+    Windows 上 HTTPServer 默认 allow_reuse_address=1，即 SO_REUSEADDR，
+    它允许**两个进程同时 bind 同一个端口**。后果非常隐蔽：
+    用户重复双击 start.bat 起了两个实例，请求被随机分给新/旧进程，
+    表现为"一会儿正常、一会儿报接口不存在/数据不对"。
+    这里改成独占绑定：端口已被占用时直接失败，宁可启动不起来也绝不双实例。
+    """
+    allow_reuse_address = False
+
+    def server_bind(self):
+        if os.name == "nt":
+            try:
+                import socket as _s
+                self.socket.setsockopt(_s.SOL_SOCKET, _s.SO_EXCLUSIVEADDRUSE, 1)
+            except Exception:
+                pass
+        super().server_bind()
+
+
 def serve(host="127.0.0.1", port=8787, open_browser=False):
-    httpd = ThreadingHTTPServer((host, port), Handler)
+    try:
+        httpd = _ExclusiveServer((host, port), Handler)
+    except OSError as exc:
+        raise AppError("E1004",
+                       "端口 %d 已被占用，可能已经有一个诊所在运行。"
+                       "请先在浏览器打开 http://%s:%d/ 确认；"
+                       "确实要重开请先关闭旧窗口/任务管理器里结束 python 进程。（%s）"
+                       % (port, host, port, exc),
+                       retryable=False, http_status=500) from exc
     httpd.daemon_threads = True
     url = "http://%s:%d/" % (host, port)
     log.info("服务启动：%s", url)

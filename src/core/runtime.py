@@ -32,7 +32,7 @@ def bootstrap(root, port=8787, open_browser=False, safe_mode_override=None,
 
     logging_setup.init(os.path.join(root, "logs"))
     log.info("=" * 60)
-    log.info("系统启动 version=phase1 db=%s", db_path)
+    log.info("系统启动 version=1.0.0 db=%s", db_path)
 
     db.init(db_path)
     set_ctx(Context(source="SYSTEM"))

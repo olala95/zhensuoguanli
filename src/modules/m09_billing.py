@@ -110,10 +110,13 @@ def _line_net(conn, bill_item_id):
 
 
 def _settle_guard(conn, biz_date=None):
-    """F58 R8 / F64 R4：当日已日结则禁止生成或修改当日账单（E3006）。"""
+    """F58 R8 / F64 R4：当日已日结则禁止生成或修改当日账单（E3006）。
+
+    已作废（撤销）的日结不算数 —— 误点日结后必须能把当天恢复正常营业。
+    """
     d = biz_date or tu.today_str()
     row = db.query_one("SELECT id, settlement_no FROM day_settlement WHERE biz_date=? "
-                       "ORDER BY id DESC LIMIT 1", (d,))
+                       "AND voided_at IS NULL ORDER BY id DESC LIMIT 1", (d,))
     return row
 
 
@@ -654,6 +657,60 @@ def settlement_close(ctx, body, q):
        action="settlement.list")
 def settlement_list(ctx, body, q):
     return {"items": db.query("SELECT * FROM day_settlement ORDER BY id DESC LIMIT 100")}
+
+
+@route("/api/settlement/today", "GET", perm="finance.view", module=MODULE,
+       action="settlement.today")
+def settlement_today(ctx, body, q):
+    """今日日结状态：界面据此提前提示"已日结、当日锁定"，而不是等用户点了才报错。"""
+    d = (q.get("biz_date") or "").strip() or tu.today_str()
+    row = db.query_one("SELECT * FROM day_settlement WHERE biz_date=? AND voided_at IS NULL "
+                       "ORDER BY id DESC LIMIT 1", (d,))
+    return {"biz_date": d, "settled": row is not None,
+            "settlement": dict(row) if row else None}
+
+
+@route("/api/settlement/reopen", "POST", perm="settlement.close", module=MODULE,
+       action="settlement.reopen")
+def settlement_reopen(ctx, body, q):
+    """F64 撤销当日日结（受限）。
+
+    为什么需要：单机诊所没有财务复核岗，「执行日结」按钮误点一次，
+    当天所有收银就被 E3006 锁死，等于停业一天。
+    限制条件（缺一不可）：
+      · 只能撤销**当天**的日结（历史账期不允许回改）
+      · 只能撤销**最近一次**未作废的日结
+      · 必须填写原因，且写 audit_high_risk（不可删的痕迹）
+    不删除记录，只打 voided_at 标记；关联账单的 settlement_id 一并解绑。
+    """
+    reason = (body.get("reason") or "").strip()
+    require(len(reason) >= 4, "撤销日结必须填写原因（至少 4 个字）")
+    biz_date = (body.get("biz_date") or "").strip() or tu.today_str()
+    if biz_date != tu.today_str():
+        raise conflict("只能撤销当日（%s）的日结；历史账期不允许回改（F64）"
+                       % tu.today_str(), code="E3079")
+    with db.tx() as conn:
+        row = db.query_one("SELECT * FROM day_settlement WHERE biz_date=? AND voided_at IS NULL "
+                           "ORDER BY id DESC LIMIT 1", (biz_date,))
+        if row is None:
+            raise not_found("营业日 %s 没有可撤销的日结" % biz_date)
+        newer = db.query_one("SELECT id FROM day_settlement WHERE biz_date=? AND id>? "
+                             "AND voided_at IS NULL", (biz_date, row["id"]))
+        if newer:
+            raise conflict("只能撤销最近一次日结（F64）", code="E3079")
+        audit.audit_operation(conn, MODULE, "settlement.reopen", "day_settlement", row["id"],
+                              detail={"biz_date": biz_date, "reason": reason})
+        db.execute(conn, "UPDATE day_settlement SET voided_at=?, voided_by=?, void_reason=? "
+                         "WHERE id=?", (tu.now_str(), ctx.user_id, reason, row["id"]))
+        cur = db.execute(conn, "UPDATE bill SET settlement_id=NULL, settled_at=NULL, "
+                               "updated_at=?, updated_by=? WHERE settlement_id=?",
+                         (tu.now_str(), ctx.user_id, row["id"]))
+        audit.audit_high_risk(conn, audit.RISK_OVERRIDE, "day_settlement", row["id"],
+                              "撤销日结 %s：%s" % (biz_date, reason),
+                              {"settlement_no": row["settlement_no"],
+                               "unlocked_bills": cur.rowcount})
+    return {"id": row["id"], "settlement_no": row["settlement_no"], "biz_date": biz_date,
+            "voided": True, "unlocked_bills": cur.rowcount}
 
 
 # ============================================================
