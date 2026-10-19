@@ -16,7 +16,7 @@ from core import timeutil as tu, backup, selftest, migrate
 from core.api import route
 from core.errors import require, require_keys, AppError, conflict, not_found
 
-APP_VERSION = "0.1.0-phase1"
+APP_VERSION = "1.0.0"
 
 # 各数据类型对应的目标表与所属模块（F128）
 IMPORT_TARGETS = {

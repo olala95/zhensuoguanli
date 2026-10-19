@@ -32,6 +32,8 @@ cd <repo>
 python src/main.py            # 默认 8787 端口，自动打开浏览器
 ```
 
+Windows 用户也可以直接**双击 `start.bat`**（会自动找可用的 Python）。
+
 首次启动会走**初始化向导**，让你设诊所名与管理员账号。
 数据库自动建在 `data/clinic.db`（已在 `.gitignore` 中，不会提交）。
 
@@ -43,7 +45,21 @@ python src/main.py --no-browser    # 不自动开浏览器
 python src/main.py --selftest      # 只跑启动自检后退出
 ```
 
-**环境要求**：Python 3.9+（用到了较新语法），无需 pip install。
+### 环境要求：Python 3.9 或更高
+
+**Python 3.8 不可用**，不是性能问题而是会直接启动失败：
+3.8 的 `socket.getfqdn()` 在**中文计算机名**的 Windows 上会抛
+`UnicodeDecodeError`，而 `http.server` 绑定端口时一定会调它。
+
+```
+File "Python38\lib\socket.py", line 756, in getfqdn
+UnicodeDecodeError: 'utf-8' codec can't decode byte 0xcb ...
+```
+
+3.9+ 已修复该问题。`start.bat` 会在启动前检查版本，遇到 3.8 直接给出提示而不是让你
+面对一个起不来的服务。
+
+无需 `pip install`——全项目零第三方依赖。
 
 ---
 

@@ -23,6 +23,7 @@ from .logging_setup import get
 log = get("selftest")
 
 DISK_FREE_WARN_MB = 500
+AUDIT_ROWS_WARN = 500000     # 审计超过这个行数就提示归档（不阻断启动）
 
 
 def _free_mb(path):
@@ -116,6 +117,18 @@ def run_startup_checks(migrations_expected=None):
         add("backup_writable", True, bdir)
     except Exception as exc:
         add("backup_writable", False, str(exc))
+
+    # 8 审计表体积：只提示不阻断。审计不可删，但可以归档
+    # （tools/db_slim.py 会先导出 gzip CSV 再从主库移出）。
+    try:
+        row = db.query_one("SELECT COUNT(*) AS n FROM audit_operation")
+        cnt = int(row["n"]) if row else 0
+        big = cnt >= AUDIT_ROWS_WARN
+        add("audit_size", not big,
+            "audit_operation %d 条%s" % (cnt, "，建议运行 tools/db_slim.py 归档" if big else ""),
+            warn=big)
+    except Exception as exc:
+        add("audit_size", True, "无法读取：%s" % exc, warn=True)
 
     failed = [c for c in checks if c["result"] == "FAIL"]
     return checks, bool(failed)

@@ -143,8 +143,24 @@ async function viewWorkbench() {
   return renderWorkbench(q.items || [], '');
 }
 
+let WB = { filter: 'ACTIVE', items: [] };
+
+function wbFilter(list) {
+  if (WB.filter === 'ACTIVE') {
+    return list.filter(v => ['WAITING', 'IN_PROGRESS', 'SUSPENDED'].includes(v.visit_status));
+  }
+  if (WB.filter === 'DONE') return list.filter(v => v.visit_status === 'COMPLETED');
+  return list;
+}
+
+function wbSetFilter(f) { WB.filter = f; renderWorkbench(WB.items, ''); }
+
 function renderWorkbench(items, errHtml) {
-  const rows = items.map(v => `<tr>
+  WB.items = items || [];
+  const active = WB.items.filter(v => ['WAITING', 'IN_PROGRESS', 'SUSPENDED'].includes(v.visit_status)).length;
+  const done = WB.items.filter(v => v.visit_status === 'COMPLETED').length;
+  const shown = wbFilter(WB.items).slice(0, 150);
+  const rows = shown.map(v => `<tr>
     <td>${v.queue_no}</td>
     <td>${esc(v.patient_name)} <span class="hint">${v.gender === 'F' ? '女' : v.gender === 'M' ? '男' : ''}${v.birth_date ? ' · ' + v.birth_date : ''}</span></td>
     <td>${esc(v.patient_no)}</td>
@@ -160,12 +176,16 @@ function renderWorkbench(items, errHtml) {
            <button class="btn sm ghost" onclick="go('#/lab/${v.id}')">检验</button>
            <button class="btn sm ghost" onclick="go('#/treatment/${v.id}')">处置</button>
            <button class="btn sm ghost" onclick="go('#/billing/${v.id}')">收费</button>
-           <button class="btn sm ghost" onclick="go('#/print/${v.id}')">打印</button>` : ''}
+           <button class="btn sm ghost" onclick="go('#/print/${v.id}')">打印</button>
+           <button class="btn sm ghost" onclick="completeVisit(${v.id})">完成</button>` : ''}
       ${v.visit_status === 'COMPLETED'
         ? `<button class="btn sm ghost" onclick="go('#/record/${v.id}')">查看病历</button>
            <button class="btn sm ghost" onclick="go('#/billing/${v.id}')">收费/退款</button>` : ''}
+      ${v.visit_status === 'VOID' ? '<span class="hint">已作废</span>' : ''}
     </td>
   </tr>`).join('');
+  const tab = (k, label, n) => `<button class="btn sm ${WB.filter === k ? '' : 'ghost'}"
+      onclick="wbSetFilter('${k}')">${label}（${n}）</button>`;
   return `
   <div class="card">
     <h3>候诊队列 · ${today()}</h3>
@@ -179,15 +199,122 @@ function renderWorkbench(items, errHtml) {
   <div class="card">
     <h3>今日就诊</h3>
     ${errHtml}
+    <div class="row">
+      ${tab('ACTIVE', '待处理', active)}
+      ${tab('DONE', '已完成', done)}
+      ${tab('ALL', '全部', WB.items.length)}
+      <span class="spacer"></span>
+      <span class="hint">默认只看还没结束的就诊；历史记录切「全部」</span>
+    </div>
     <table><thead><tr><th>号</th><th>患者</th><th>患者号</th><th>诊别</th><th>状态</th><th>登记时间</th><th>操作</th></tr></thead>
-      <tbody>${rows || '<tr><td colspan="7" class="empty">今日暂无就诊</td></tr>'}</tbody></table>
+      <tbody>${rows || '<tr><td colspan="7" class="empty">当前筛选下暂无就诊</td></tr>'}</tbody></table>
+    ${wbFilter(WB.items).length > 150 ? '<div class="hint">仅显示最近 150 条，完整记录请用上方搜索或经营统计查询。</div>' : ''}
     <div class="hint" style="margin-top:6px">
-      每次就诊的 ID 就是上面「写病历 / 开方 / 检验 / 处置 / 收费 / 打印」按钮里的数字，
-      点进去会自动带入，<b>不用手填</b>；接诊后这些按钮才出现。
+      接诊后每一个按钮都会自动带入本次就诊，<b>不需要记 ID</b>。
     </div>
   </div>`;
 }
 function today() { return new Date().toISOString().slice(0, 10); }
+
+/* ============================================================
+   通用选择器
+   原则：界面上的每个动作都必须能从"看得见的东西"点出来，
+   绝不让操作员手填 visit_id / record_id / 处方 ID 这类内部主键。
+   ============================================================ */
+const PICK = { visits: [], at: 0, loading: false };
+const VST_LABEL = {
+  WAITING: '候诊', IN_PROGRESS: '接诊中', SUSPENDED: '挂单',
+  COMPLETED: '已完成', VOID: '已作废',
+};
+
+async function loadVisitChoices(force) {
+  if (!force && PICK.visits.length && Date.now() - PICK.at < 15000) return PICK.visits;
+  if (PICK.loading) return PICK.visits;
+  PICK.loading = true;
+  try {
+    const reqs = [
+      api('/api/visit/list', { date: today(), limit: 200 }, 'GET'),
+      api('/api/visit/list', { status: 'IN_PROGRESS', limit: 100 }, 'GET'),
+      api('/api/visit/list', { status: 'SUSPENDED', limit: 50 }, 'GET'),
+    ];
+    const rs = await Promise.all(reqs.map(p => p.catch(() => ({ items: [] }))));
+    const map = new Map();
+    rs.forEach(r => (r.items || []).forEach(v => map.set(v.id, v)));
+    // 只保留最近 30 天的就诊：超过一个月的"接诊中/挂单"属于异常遗留，
+    // 不应该长期堆在下拉里影响日常选择（可在工作台按状态筛选后处理）。
+    const cutoff = new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10);
+    PICK.visits = Array.from(map.values())
+      .filter(v => !v.registered_at || String(v.registered_at).slice(0, 10) >= cutoff)
+      .sort((a, b) => b.id - a.id)
+      .slice(0, 80);
+    PICK.at = Date.now();
+  } catch (e) {
+    PICK.visits = [];
+  } finally {
+    PICK.loading = false;
+  }
+  return PICK.visits;
+}
+
+/* 就诊下拉：只列出"今天"和"还没结束"的就诊，避免历史数据淹没当前工作 */
+function visitSelectHtml(id, opts) {
+  opts = opts || {};
+  const list = (PICK.visits || []).filter(v => !opts.status || opts.status.indexOf(v.status) >= 0);
+  const cur = opts.selected ? String(opts.selected) : '';
+  const head = `<option value="">${opts.placeholder || '— 选择就诊 —'}</option>`;
+  const body = list.map(v => {
+    const d = String(v.registered_at || '').slice(5, 10);
+    const label = [d, v.visit_no, v.patient_name, VST_LABEL[v.status] || v.status]
+      .filter(Boolean).join(' · ');
+    return `<option value="${v.id}"${String(v.id) === cur ? ' selected' : ''}>${esc(label)}</option>`;
+  }).join('');
+  const empty = list.length ? '' : '<span class="hint">今天还没有就诊记录，请到「工作台」挂号</span>';
+  return `<select id="${id}" class="pick"${opts.onchange ? ` onchange="${opts.onchange}"` : ''}>${head}${body}</select>${empty}`;
+}
+
+/* 处方下拉：按就诊联动，用于发药 / 打印 / 采纳建议 */
+function rxSelectHtml(id, opts) {
+  opts = opts || {};
+  return `<select id="${id}" class="pick"${opts.onchange ? ` onchange="${opts.onchange}"` : ''}>
+    <option value="">— 先选就诊 —</option></select>`;
+}
+
+async function fillRxSelect(selId, visitId) {
+  const el = document.getElementById(selId);
+  if (!el) return;
+  el.innerHTML = '<option value="">加载中…</option>';
+  if (!visitId) { el.innerHTML = '<option value="">— 先选就诊 —</option>'; return; }
+  try {
+    const items = (await api('/api/prescription/list', { visit_id: visitId }, 'GET')).items || [];
+    if (!items.length) { el.innerHTML = '<option value="">该就诊没有处方</option>'; return; }
+    el.innerHTML = '<option value="">— 选择处方 —</option>' + items.map(r => {
+      const label = [r.prescription_no, r.prescription_type === 'HERB' ? '中药' : '成药',
+        r.status, yuan(r.total_amount) + '元'].filter(Boolean).join(' · ');
+      return `<option value="${r.id}">${esc(label)}</option>`;
+    }).join('');
+  } catch (e) {
+    el.innerHTML = '<option value="">读取失败</option>';
+  }
+}
+
+/* 账单下拉：按就诊联动 */
+async function fillBillSelect(selId, visitId) {
+  const el = document.getElementById(selId);
+  if (!el) return;
+  if (!visitId) { el.innerHTML = '<option value="">— 先选就诊 —</option>'; return; }
+  el.innerHTML = '<option value="">加载中…</option>';
+  try {
+    const items = (await api('/api/finance/bills', { visit_id: visitId, limit: 20 }, 'GET')).items || [];
+    if (!items.length) { el.innerHTML = '<option value="">该就诊没有账单</option>'; return; }
+    el.innerHTML = '<option value="">— 选择账单 —</option>' + items.map(b => {
+      const label = [b.bill_no, b.status, yuan(b.total_amount_fen) + '元'].filter(Boolean).join(' · ');
+      return `<option value="${b.id}">${esc(label)}</option>`;
+    }).join('');
+  } catch (e) {
+    el.innerHTML = '<option value="">读取失败</option>';
+  }
+}
+
 
 async function searchPatient() {
   const kw = $('#kw').value.trim();
@@ -776,15 +903,21 @@ async function completeVisit(id) {
 }
 /* 从工作台点「收费」进来：自动找/建该就诊的账单，不用再手填账单 ID */
 async function blAuto(vid) {
-  try {
-    // /api/bill/get 传 visit_id 会直接取该就诊最新的有效账单（没有 /api/bill/list 这个接口）
-    const b = await api('/api/bill/get', { visit_id: vid }, 'GET');
-    P3.billId = b.id;
-    const el = document.getElementById('bl_bill');
-    if (el) el.value = b.id;
+  const vsel = document.getElementById('bl_visit');
+  if (vsel) {
+    if (!Array.from(vsel.options).some(o => String(o.value) === String(vid))) {
+      vsel.insertAdjacentHTML('beforeend', `<option value="${vid}">就诊 #${vid}（来自工作台）</option>`);
+    }
+    vsel.value = String(vid);
+  }
+  P3.visitId = vid;
+  await fillBillSelect('bl_bill', vid);
+  const bsel = document.getElementById('bl_bill');
+  if (bsel && bsel.value) {
+    P3.billId = bsel.value;
     await blLoad();
-    toast('已载入该就诊的账单 ' + b.bill_no, 'ok');
-  } catch (e) {
+    toast('已载入该就诊的账单', 'ok');
+  } else {
     // 该就诊还没建账单，不阻断页面，提示用户点「生成账单」
     toast('该就诊还没有账单，点「生成账单」即可', 'ok');
   }
@@ -793,20 +926,19 @@ async function blAuto(vid) {
 /* 从工作台点「打印」进来：自动带出处方与账单 ID */
 async function tryFillPrint(vid) {
   try {
-    const rxs = (await api('/api/prescription/list', { visit_id: vid }, 'GET')).items || [];
-    if (rxs.length) {
-      const id = rxs[rxs.length - 1].id;
-      for (const k of ['pr_rx', 'pr_rx2']) { const el = document.getElementById(k); if (el) el.value = id; }
+    const vsel = document.getElementById('pr_visit');
+    if (vsel) {
+      if (!Array.from(vsel.options).some(o => String(o.value) === String(vid))) {
+        vsel.insertAdjacentHTML('beforeend', `<option value="${vid}">就诊 #${vid}（来自工作台）</option>`);
+      }
+      vsel.value = String(vid);
     }
+    await fillRxSelect('pr_rx', vid);
+    await fillBillSelect('pr_bill', vid);
     const v = await api('/api/visit/get', { id: vid }, 'GET');
-    try {
-      const b = await api('/api/bill/get', { visit_id: vid }, 'GET');
-      const el = document.getElementById('pr_bill');
-      if (el) el.value = b.id;
-    } catch (e) { /* 没账单就不填，用户可手填 */ }
     const msg = document.getElementById('pr_msg');
     if (msg) msg.innerHTML = `当前就诊：<b>${esc(v.visit_no)}</b> · ${esc(v.patient_name || '')}
-      （已自动填入处方/账单，可直接在上面点打印）`;
+      （处方与账单已自动列出，直接在上面选好点打印）`;
   } catch (e) { console.warn('tryFillPrint:', e.message); }
 }
 
@@ -1190,12 +1322,13 @@ async function viewLab() {
     agencies = (await api('/api/lab/agency/list', {}, 'GET')).items || [];
     items = (await api('/api/lab/item/search', { keyword: '' }, 'GET')).items || [];
   } catch (e) { /* 权限不足时降级为只读提示 */ }
+  try { await loadVisitChoices(); } catch (e) { }
   return `
   <div class="card">
     <h3>检验检查（全部外送）</h3>
     <div class="row">
-      <input id="lb_visit" placeholder="visit_id" style="width:120px" value="${LB.visitId || ''}">
-      <button class="btn ghost sm" onclick="lbLoad()">载入该就诊的检验单</button>
+      ${visitSelectHtml('lb_visit', { selected: LB.visitId, onchange: 'lbLoad()' })}
+      <button class="btn sm" onclick="lbLoad()">载入该就诊检验单</button>
       <span class="spacer"></span>
       <button class="btn ghost sm" onclick="lbNewAgency()">新增机构</button>
       <button class="btn ghost sm" onclick="lbNewItem()">新增项目</button>
@@ -1206,15 +1339,16 @@ async function viewLab() {
       已登记机构 ${agencies.length} 家 / 外送项目 ${items.length} 项。
       流程：开单 → 采样 → 送检 → 回报 → 录入结果 → 医生阅片。
     </div>
-    <div id="lb_body"><div class="hint">填入 visit_id 后载入。</div></div>
+    <div id="lb_body"><div class="hint">先在上方选择本次就诊，再点「载入」。</div></div>
   </div>`;
 }
 
 async function lbLoad() {
   LB.visitId = parseInt(val('lb_visit')) || 0;
-  if (!LB.visitId) { toast('请填 visit_id', 'err'); return; }
+  if (!LB.visitId) { toast('请先选择就诊', 'err'); return; }
   try {
     const list = (await api('/api/lab/order/list', { visit_id: LB.visitId }, 'GET')).items || [];
+    const catItems = (await api('/api/lab/item/search', { keyword: '' }, 'GET')).items || [];
     const rows = list.map(o => `<tr>
       <td>${esc(o.order_no)}</td><td>${statusTag(o.status)}</td>
       <td>${o.total_amount != null ? (o.total_amount / 100).toFixed(2) + ' 元' : '-'}</td>
@@ -1227,13 +1361,18 @@ async function lbLoad() {
         ${['REPORTED'].includes(o.status) ? `<button class="btn sm" onclick="lbReview(${o.id})">阅片</button>` : ''}
         ${['DRAFT', 'ORDERED', 'SAMPLED'].includes(o.status) ? `<button class="btn sm warn" onclick="lbCancel(${o.id})">作废</button>` : ''}
       </td></tr>`).join('');
+    const itemBoxes = catItems.map(i => `<label class="chk"><input type="checkbox" class="lb_item_chk" value="${i.id}">
+        ${esc(i.name)} <span class="hint">${yuan(i.price_fen)} 元</span></label>`).join('');
     $('#lb_body').innerHTML = `
       <div class="section-title" style="margin-top:12px">新建检验申请</div>
       <div class="row">
         <input id="lb_note" style="flex:1" placeholder="临床诊断 / 送检目的">
-        <input id="lb_item_id" placeholder="项目 id（多个用逗号）" style="width:220px">
-        <button class="btn" onclick="lbCreate()">开单并提交</button>
       </div>
+      <div class="hint" style="margin:4px 0 6px">勾选检验项目（可多选）：</div>
+      <div class="row" id="lb_items" style="gap:6px 16px">
+        ${itemBoxes || '<span class="hint">还没有检验项目，先点右上「新增项目」</span>'}
+      </div>
+      <div class="row"><button class="btn" onclick="lbCreate()">开单并提交</button></div>
       <div class="section-title" style="margin-top:12px">本就诊检验单（${list.length}）</div>
       <table class="tbl"><thead><tr><th>申请号</th><th>状态</th><th>金额</th><th>开单时间</th><th>操作</th></tr></thead>
       <tbody>${rows || '<tr><td colspan="5" class="hint">无</td></tr>'}</tbody></table>
@@ -1242,7 +1381,9 @@ async function lbLoad() {
 }
 
 async function lbCreate() {
-  const ids = val('lb_item_id').split(',').map(s => parseInt(s.trim())).filter(Boolean);
+  const ids = Array.from(document.querySelectorAll('.lb_item_chk:checked'))
+    .map(el => parseInt(el.value)).filter(Boolean);
+  if (!ids.length) { toast('请至少勾选一个检验项目', 'err'); return; }
   try {
     const o = await api('/api/lab/order/create', { visit_id: LB.visitId, clinical_note: val('lb_note') });
     if (ids.length) await api('/api/lab/order/save/items', { lab_order_id: o.id, items: ids.map(i => ({ lab_item_id: i })) });
@@ -1363,6 +1504,7 @@ async function viewPrint() {
   try { devs = (await api('/api/hardware/devices', {}, 'GET')).items || []; } catch (e) { }
   try { tpls = (await api('/api/print/templates', {}, 'GET')).items || []; } catch (e) { }
   try { fails = (await api('/api/print/failures', {}, 'GET')).items || []; } catch (e) { }
+  try { await loadVisitChoices(); } catch (e) { }
   const st = { PENDING: '待打印', PRINTING: '打印中', SUCCESS: '成功', FAILED: '失败', RETRYING: '重试中', ABANDONED: '已放弃' };
   const rows = jobs.map(j => `<tr>
     <td>${esc(j.print_job_no)}</td><td>${esc(j.biz_type || '')}</td>
@@ -1381,12 +1523,14 @@ async function viewPrint() {
   <div class="card">
     <h3>打印与硬件（M10）</h3>
     <div class="row">
-      <input id="pr_rx" placeholder="处方 id" style="width:110px">
+      ${visitSelectHtml('pr_visit', { selected: 0, onchange: 'prVisitChanged()' })}
+      <select id="pr_rx" class="pick"><option value="">— 处方 —</option></select>
       <button class="btn ghost sm" onclick="prRx()">打处方笺</button>
-      <input id="pr_bill" placeholder="账单 id" style="width:110px">
-      <button class="btn ghost sm" onclick="prBill()">打收费凭条</button>
-      <input id="pr_rx2" placeholder="处方 id" style="width:110px">
       <button class="btn ghost sm" onclick="prLabel()">打药袋标签</button>
+    </div>
+    <div class="row">
+      <select id="pr_bill" class="pick"><option value="">— 账单 —</option></select>
+      <button class="btn ghost sm" onclick="prBill()">打收费凭条</button>
       <span class="spacer"></span>
       <button class="btn ghost sm" onclick="prHealth()">硬件自检</button>
       <button class="btn ghost sm" onclick="prScan()">扫码</button>
@@ -1407,13 +1551,18 @@ async function viewPrint() {
       <input id="hw_name" placeholder="设备名称" style="width:160px">
       <button class="btn sm ghost" onclick="prDevRegister()">登记设备</button>
       <button class="btn sm ghost" onclick="prEvents()">硬件事件</button>
-      <input id="ckrx_id" placeholder="处方 ID" style="width:110px">
       <button class="btn sm ghost" onclick="prCheckRx()">扫码核对处方</button>
     </div>
     <div id="pr_more" class="hint"></div>
     <div id="pr_msg" class="hint" style="margin-top:8px"></div>
   </div>`;
 }
+async function prVisitChanged() {
+  const vid = val('pr_visit');
+  await fillRxSelect('pr_rx', vid);
+  await fillBillSelect('pr_bill', vid);
+}
+
 async function prDevRegister() {
   const code = val('hw_code'); if (!code) { toast('填驱动码', 'err'); return; }
   try { await api('/api/hardware/device/register', { driver_code: code,
@@ -1431,7 +1580,7 @@ async function prEvents() {
   } catch (e) { toast(e.message, 'err'); }
 }
 async function prCheckRx() {
-  const id = parseInt(val('ckrx_id')); if (!id) { toast('填处方 ID', 'err'); return; }
+  const id = parseInt(val('pr_rx')); if (!id) { toast('请先在上方选择处方', 'err'); return; }
   // 后端要求 prescription_id + code（扫到的条码/编码），只传处方号会被拒
   const code = prompt('扫描/输入药品或饮片条码：');
   if (!code) return;
@@ -1442,9 +1591,9 @@ async function prCheckRx() {
   } catch (e) { toast(e.message, 'err'); }
 }
 function prMsg(t) { const el = document.getElementById('pr_msg'); if (el) el.innerHTML = t; }
-async function prRx() { const id = parseInt(val('pr_rx')); if (!id) return toast('填处方 id', 'err'); try { const j = await api('/api/print/prescription', { prescription_id: id }); await api('/api/print/job/execute', { job_id: j.id }); toast('已打印 ' + j.print_job_no, 'ok'); render(); } catch (e) { toast(e.message, 'err'); } }
-async function prBill() { const id = parseInt(val('pr_bill')); if (!id) return toast('填账单 id', 'err'); try { const j = await api('/api/print/receipt', { bill_id: id }); await api('/api/print/job/execute', { job_id: j.id }); toast('已打印 ' + j.print_job_no, 'ok'); render(); } catch (e) { toast(e.message, 'err'); } }
-async function prLabel() { const id = parseInt(val('pr_rx2')); if (!id) return toast('填处方 id', 'err'); try { const j = await api('/api/print/label', { prescription_id: id }); await api('/api/print/job/execute', { job_id: j.id }); toast('已打印 ' + j.print_job_no, 'ok'); render(); } catch (e) { toast(e.message, 'err'); } }
+async function prRx() { const id = parseInt(val('pr_rx')); if (!id) return toast('请先选择处方', 'err'); try { const j = await api('/api/print/prescription', { prescription_id: id }); await api('/api/print/job/execute', { job_id: j.id }); toast('已打印 ' + j.print_job_no, 'ok'); render(); } catch (e) { toast(e.message, 'err'); } }
+async function prBill() { const id = parseInt(val('pr_bill')); if (!id) return toast('请先选择账单', 'err'); try { const j = await api('/api/print/receipt', { bill_id: id }); await api('/api/print/job/execute', { job_id: j.id }); toast('已打印 ' + j.print_job_no, 'ok'); render(); } catch (e) { toast(e.message, 'err'); } }
+async function prLabel() { const id = parseInt(val('pr_rx')); if (!id) return toast('请先选择处方', 'err'); try { const j = await api('/api/print/label', { prescription_id: id }); await api('/api/print/job/execute', { job_id: j.id }); toast('已打印 ' + j.print_job_no, 'ok'); render(); } catch (e) { toast(e.message, 'err'); } }
 async function prExec(id) { try { await api('/api/print/job/execute', { job_id: id }); toast('已执行', 'ok'); render(); } catch (e) { toast(e.message, 'err'); } }
 async function prReprint(id) { const r = prompt('重打原因：', '补打'); if (r === null) return; try { const x = await api('/api/print/job/reprint', { job_id: id, reason: r }); toast('已重打，单号不变：' + x.print_job_no, 'ok'); render(); } catch (e) { toast(e.message, 'err'); } }
 async function prRetry(id) { try { const x = await api('/api/print/job/retry', { job_id: id }); toast(x.abandoned ? '重试超限已放弃' : '重试成功', x.abandoned ? 'err' : 'ok'); render(); } catch (e) { toast(e.message, 'err'); } }
@@ -1462,6 +1611,7 @@ async function viewAi() {
   let tasks = [], drafts = [];
   try { tasks = (await api('/api/ai/task/list', { limit: 20 }, 'GET')).items || []; } catch (e) { }
   try { drafts = (await api('/api/ai/draft/list', { limit: 20 }, 'GET')).items || []; } catch (e) { }
+  try { await loadVisitChoices(); } catch (e) { }
   const rows = tasks.map(t => `<tr><td>${esc(t.task_no)}</td><td>${esc(t.task_type)}</td>
     <td>${statusTag(t.status)}</td><td>${esc(t.created_at || '')}</td>
     <td>${['FAILED', 'ABANDONED'].includes(t.status) ? `<button class="btn sm ghost" onclick="aiRetry(${t.id})">重试</button>` : ''}
@@ -1476,7 +1626,7 @@ async function viewAi() {
     <h3>AI 与语音（M04）</h3>
     <div class="hint">AI 只生成草稿，**医生确认后才写入病历**，落库时标记来源。</div>
     <div class="row" style="margin-top:8px">
-      <input id="ai_visit" placeholder="visit_id" style="width:110px" value="${AI.visitId || ''}">
+      ${visitSelectHtml('ai_visit', { selected: AI.visitId, onchange: 'aiVisitChanged()' })}
       <button class="btn" onclick="aiAsr()">语音转写</button>
       <button class="btn ghost" onclick="aiExtract()">要素抽取</button>
       <button class="btn ghost" onclick="aiDraftCreate()">生成病历草稿</button>
@@ -1498,10 +1648,12 @@ async function viewAi() {
     <div id="ai_msg" class="hint" style="margin-top:8px"></div>
   </div>`;
 }
+function aiVisitChanged() { AI.visitId = parseInt(val('ai_visit')) || 0; }
+
 function aiMsg(t) { const el = document.getElementById('ai_msg'); if (el) el.innerHTML = t; else toast(t, 'ok'); }
 async function aiTask(type) {
   AI.visitId = parseInt(val('ai_visit')) || 0;
-  if (!AI.visitId) { toast('请填 visit_id', 'err'); return null; }
+  if (!AI.visitId) { toast('请先选择就诊', 'err'); return null; }
   const t = await api('/api/ai/task/create', { task_type: type, visit_id: AI.visitId });
   AI.taskId = t.id; return t.id;
 }
@@ -1560,7 +1712,16 @@ async function aiDraft(id) {
     modal('病历草稿 #' + id, `<pre style="white-space:pre-wrap;font-size:12px;max-height:400px;overflow:auto">${esc(JSON.stringify(d, null, 2))}</pre>`);
   } catch (e) { toast(e.message, 'err'); }
 }
-async function aiApply(id) { const rid = prompt('要写入的 record_id：'); if (!rid) return; try { await api('/api/ai/draft/apply', { draft_id: id, record_id: parseInt(rid) }); toast('已采纳入病历（来源标记为 AI 已确认）', 'ok'); render(); } catch (e) { toast(e.message, 'err'); } }
+async function aiApply(id) {
+  const vid = parseInt(val('ai_visit')) || AI.visitId || 0;
+  if (!vid) { toast('请先选择就诊', 'err'); return; }
+  try {
+    const r = await api('/api/record/get', { visit_id: vid }, 'GET');
+    if (!r || r.exists === false) { toast('该就诊还没有病历，请先到病历页接诊', 'err'); return; }
+    await api('/api/ai/draft/apply', { draft_id: id, record_id: r.id });
+    toast('已采纳入病历（来源标记为 AI 已确认）', 'ok'); render();
+  } catch (e) { toast(e.message, 'err'); }
+}
 async function aiReject(id) { const r = prompt('驳回原因：'); if (!r) return; try { await api('/api/ai/draft/reject', { draft_id: id, reason: r }); toast('已驳回', 'ok'); render(); } catch (e) { toast(e.message, 'err'); } }
 
 async function showStatusLog(rid) {
@@ -1644,12 +1805,20 @@ async function loadSystemExtras() {
       || (await api('/api/system/roles', {}, 'GET')).roles || [];
     const roleOpts = roles.map(r => typeof r === 'string' ? r : (r.role_code || r.code))
       .filter(Boolean).map(r => `<option value="${esc(r)}">${esc(r)}</option>`).join('');
-    $('#userList').innerHTML = `<table><thead><tr><th>账号</th><th>姓名</th><th>角色</th><th>状态</th><th>最近登录</th><th>操作</th></tr></thead><tbody>${
-      u.items.map(x => `<tr><td>${esc(x.username)}</td><td>${esc(x.display_name)}</td><td>${esc(x.roles || '')}</td>
-      <td>${x.is_active ? '<span class="tag ok">启用</span>' : '<span class="tag danger">停用</span>'}</td><td>${esc(x.last_login_at || '-')}</td>
+    const active = u.items.filter(x => x.is_active);
+    const disabled = u.items.filter(x => !x.is_active);
+    const userRow = x => `<tr><td>${esc(x.username)}</td><td>${esc(x.display_name)}</td>
+      <td>${esc(x.roles || '')}</td>
+      <td>${x.is_active ? '<span class="tag ok">启用</span>' : '<span class="tag danger">停用</span>'}</td>
+      <td>${esc(x.last_login_at || '-')}</td>
       <td><button class="btn sm ghost" onclick="sysUserRoles(${x.id})">改角色</button>
           <button class="btn sm ghost" onclick="sysResetPwd(${x.id})">改口令</button>
-          ${x.is_active ? `<button class="btn sm warn" onclick="sysDisableUser(${x.id})">停用</button>` : ''}</td></tr>`).join('')}</tbody></table>
+          ${x.is_active ? `<button class="btn sm warn" onclick="sysDisableUser(${x.id})">停用</button>` : ''}</td></tr>`;
+    $('#userList').innerHTML = `<table><thead><tr><th>账号</th><th>姓名</th><th>角色</th><th>状态</th><th>最近登录</th><th>操作</th></tr></thead>
+      <tbody>${active.map(userRow).join('') || '<tr><td colspan="6" class="empty">暂无启用账号</td></tr>'}</tbody></table>
+      ${disabled.length ? `<details style="margin-top:8px"><summary class="hint">已停用账号 ${disabled.length} 个（点击展开）</summary>
+        <table><thead><tr><th>账号</th><th>姓名</th><th>角色</th><th>状态</th><th>最近登录</th><th>操作</th></tr></thead>
+        <tbody>${disabled.map(userRow).join('')}</tbody></table></details>` : ''}
       <div class="hint" style="margin-top:6px">可用角色：${roles.map(r => esc(typeof r === 'string' ? r : (r.role_code || r.code))).join('、') || '-'}</div>
       <div class="hint" id="roleHint"></div>`;
     window.__roleOptsCache = roleOpts;
@@ -1910,6 +2079,7 @@ function num(v, d) { const n = parseFloat(v); return isNaN(n) ? (d || 0) : n; }
 async function viewPharmacy() {
   let alerts = [];
   try { alerts = (await api('/api/stock/alerts', { status: 'OPEN' }, 'GET')).items || []; } catch (e) { }
+  try { await loadVisitChoices(); } catch (e) { }
   return `
   <div class="card">
     <h3>库存查询</h3>
@@ -1948,12 +2118,16 @@ async function viewPharmacy() {
   <div class="card">
     <h3>发药 / 退药（F51 / F115 / F46）</h3>
     <div class="row">
-      <input id="rx_id" placeholder="处方 ID 或处方号" style="width:200px">
+      ${visitSelectHtml('ph_visit', { selected: P3.visitId, onchange: 'phVisitChanged()' })}
+      <select id="rx_id" class="pick" onchange="phLoadRx()"><option value="">— 先选就诊 —</option></select>
+    </div>
+    <div class="row">
       <button class="btn sm" onclick="phLoadRx()">读取处方</button>
       <button class="btn sm ghost" onclick="phDispense('WEST')">成药发药</button>
-      <button class="btn sm ghost" onclick="phDispense('HERB')">中药发药</button>
+      <button class="btn sm ghost" onclick="phDispense('HERB')">中药发药（自煎）</button>
+      <label class="hint"><input type="checkbox" id="ph_daijian"> 代煎</label>
     </div>
-    <div id="rx_info" class="hint">先读取处方，再执行发药或退药</div>
+    <div id="rx_info" class="hint">先选就诊 → 选处方 → 读取，再执行发药或退药</div>
     <div class="row" style="margin-top:6px">
       <input id="rt_qty" placeholder="退药数量" style="width:120px">
       <input id="rt_reason" placeholder="退药原因（必填）" style="flex:1">
@@ -2158,9 +2332,20 @@ async function phSubmitIn() {
   } catch (e) { toast(e.message, 'err'); }
 }
 
+async function phVisitChanged() {
+  const vid = val('ph_visit');
+  P3.visitId = vid;
+  P3.rxId = 0;
+  await fillRxSelect('rx_id', vid);
+  const sel = document.getElementById('rx_id');
+  if (sel && sel.value) { phLoadRx(); }
+  else if (vid) { document.getElementById('rx_info').innerHTML = '该就诊还没有处方，请医生先开方'; }
+}
+
 async function phLoadRx() {
   try {
     const id = val('rx_id');
+    if (!id) { toast('请先选择处方', 'err'); return; }
     const r = await api('/api/prescription/get', { id: id }, 'GET');
     P3.rxId = r.id;
     $('#rx_info').innerHTML = `<div>处方 ${esc(r.prescription_no)} · 类型 ${esc(r.prescription_type)}
@@ -2174,7 +2359,8 @@ async function phDispense(kind) {
   if (!P3.rxId) { toast('请先读取处方', 'err'); return; }
   try {
     const r = kind === 'WEST' ? await api('/api/pharmacy/dispense', { prescription_id: P3.rxId })
-      : await api('/api/pharmacy/herb_dispense', { prescription_id: P3.rxId, decoction_type: 'ZIJIAN' });
+      : await api('/api/pharmacy/herb_dispense', { prescription_id: P3.rxId,
+          decoction_type: (document.getElementById('ph_daijian') || {}).checked ? 'DAIJIAN' : 'ZIJIAN' });
     toast('发药完成，处方状态 ' + r.status, 'ok');
     phLoadRx();
   } catch (e) { toast(e.message, 'err'); }
@@ -2229,25 +2415,24 @@ async function phTxns() {
 
 /* ===== 处置 ===== */
 async function viewTreatment() {
+  try { await loadVisitChoices(); } catch (e) { }
   return `
   <div class="card">
     <h3>开立处置（F52/F54）</h3>
     <div class="row">
-      <input id="tr_visit" placeholder="就诊 ID" style="width:140px" value="${esc(P3.visitId)}">
+      ${visitSelectHtml('tr_visit', { selected: P3.visitId, onchange: 'trLoad()' })}
       <input id="tr_kw" placeholder="处置项目关键词" style="flex:1">
       <button class="btn sm" onclick="trSearch()">搜索项目</button>
+      <button class="btn sm ghost" onclick="trLoad()">刷新本就诊处置</button>
     </div>
-    <div id="tr_result" class="hint">搜索项目后可开立（支持组套：/api/treatment/package/list）</div>
-    <div class="row" style="margin-top:6px">
-      <button class="btn sm ghost" onclick="trLoad()">刷新该就诊的处置列表</button>
-    </div>
+    <div id="tr_result" class="hint">搜索项目后可开立（支持组套）</div>
     <div id="tr_list"></div>
   </div>
 
   <div class="card">
     <h3>中医治疗记录 / 过程记录（F116 / F56）</h3>
     <div class="row">
-      <input id="tr_exec" placeholder="处置执行 ID" style="width:160px">
+      <select id="tr_exec" class="pick"><option value="">— 先在上方列表里点「记录」 —</option></select>
       <button class="btn sm" onclick="trLoadExec()">读取</button>
     </div>
     <div id="tr_exec_info" class="hint">读取后可填写中医治疗记录与过程记录</div>
@@ -2388,19 +2573,34 @@ async function trOrder(itemId) {
 
 async function trLoad() {
   const vid = val('tr_visit') || P3.visitId;
-  if (!vid) { toast('请填写就诊 ID', 'err'); return; }
+  if (!vid) { toast('请先选择就诊', 'err'); return; }
   P3.visitId = vid;
   try {
     const d = await api('/api/treatment/list', { visit_id: vid }, 'GET');
+    const items = d.items || [];
     $('#tr_list').innerHTML = `<table><thead><tr><th>执行号</th><th>项目</th><th>金额</th><th>状态</th><th>操作</th></tr></thead><tbody>${
-      (d.items || []).map(t => `<tr><td>${esc(t.exec_no)}</td><td>${esc(t.item_name_snap)}</td>
+      items.map(t => `<tr><td>${esc(t.exec_no)}</td><td>${esc(t.item_name_snap)}</td>
         <td>${esc(yuan(t.amount_fen))}</td><td>${esc(t.status)}</td><td>
         <button class="btn sm ghost" onclick="trAct(${t.id},'start')">开始</button>
         <button class="btn sm ghost" onclick="trAct(${t.id},'complete')">完成</button>
+        <button class="btn sm ghost" onclick="trPickExec(${t.id})">记录</button>
         <button class="btn sm ghost" onclick="trInterrupt(${t.id})">中断</button>
         <button class="btn sm ghost" onclick="trCancel(${t.id})">取消</button></td></tr>`).join('')
       || '<tr><td class="empty" colspan="5">该就诊暂无处置</td></tr>'}</tbody></table>`;
+    const sel = document.getElementById('tr_exec');
+    if (sel) {
+      const cur = sel.value;
+      sel.innerHTML = '<option value="">— 选择已开立的处置 —</option>' + items.map(t =>
+        `<option value="${t.id}">${esc(t.exec_no)} · ${esc(t.item_name_snap)} · ${esc(t.status)}</option>`).join('');
+      if (cur) sel.value = cur;
+    }
   } catch (e) { toast(e.message, 'err'); }
+}
+
+function trPickExec(id) {
+  const sel = document.getElementById('tr_exec');
+  if (sel) { sel.value = String(id); }
+  trLoadExec();
 }
 
 async function trAct(id, act) {
@@ -2451,16 +2651,17 @@ async function trProcAdd() {
 async function viewBilling() {
   let settles = [];
   try { settles = (await api('/api/settlement/list', {}, 'GET')).items || []; } catch (e) { }
+  try { await loadVisitChoices(); } catch (e) { }
   return `
   <div class="card">
     <h3>账单（F58/F59/F60）</h3>
     <div class="row">
-      <input id="bl_visit" placeholder="就诊 ID" style="width:140px">
+      ${visitSelectHtml('bl_visit', { selected: P3.visitId, onchange: 'blVisitChanged()' })}
       <button class="btn sm" onclick="blCreate()">生成账单</button>
-      <input id="bl_bill" placeholder="账单 ID（查询用）" style="width:160px">
+      <select id="bl_bill" class="pick" onchange="blLoad()"><option value="">— 选择账单 —</option></select>
       <button class="btn sm ghost" onclick="blLoad()">查询账单</button>
     </div>
-    <div id="bl_info" class="hint">生成账单后在此查看明细、收费、退款与冲正</div>
+    <div id="bl_info" class="hint">选择就诊后可生成账单，再在此查看明细、收费、退款与冲正</div>
   </div>
 
   <div class="card">
@@ -2472,6 +2673,8 @@ async function viewBilling() {
       <button class="btn sm" onclick="blPay()">收费</button>
       <span class="hint">无部分支付：多笔合计必须等于应收</span>
     </div>
+    <div class="hint">日常退款 / 冲正：直接在上方账单明细对应行点「退款」或「冲正」。</div>
+    <details style="margin-top:6px"><summary class="hint">高级：按明细行操作（需知道行 ID）</summary>
     <div class="row">
       <input id="rf_item" placeholder="账单明细行 ID" style="width:160px">
       <input id="rf_amount" placeholder="退款金额（元）" style="width:140px">
@@ -2484,6 +2687,7 @@ async function viewBilling() {
       <input id="rv_reason" placeholder="冲正原因（必填）" style="flex:1">
       <button class="btn sm ghost" onclick="blReversal()">红字冲正</button>
     </div>
+    </details>
   </div>
 
   <div class="card">
@@ -2611,29 +2815,43 @@ async function blRefundList() {
   } catch (e) { toast(e.message, 'err'); }
 }
 
+async function blVisitChanged() {
+  const vid = val('bl_visit');
+  P3.visitId = vid;
+  await fillBillSelect('bl_bill', vid);
+  const sel = document.getElementById('bl_bill');
+  if (sel && sel.value) { P3.billId = sel.value; await blLoad(); }
+  else if (vid) { toast('该就诊还没有账单，点「生成账单」即可', 'ok'); }
+}
+
 async function blCreate() {
   const vid = val('bl_visit');
-  if (!vid) { toast('请填写就诊 ID', 'err'); return; }
+  if (!vid) { toast('请先选择就诊', 'err'); return; }
   try {
     const b = await api('/api/bill/create', { visit_id: Number(vid) });
     toast('账单已生成：' + b.bill_no, 'ok');
-    $('#bl_bill').value = b.id; P3.billId = b.id; blLoad();
+    await fillBillSelect('bl_bill', vid);
+    const sel = document.getElementById('bl_bill');
+    if (sel) sel.value = String(b.id);
+    P3.billId = b.id; blLoad();
   } catch (e) { toast(e.message, 'err'); }
 }
 
 async function blLoad() {
   const id = val('bl_bill') || P3.billId;
-  if (!id) { toast('请填写账单 ID', 'err'); return; }
+  if (!id) { toast('请先选择账单', 'err'); return; }
   P3.billId = id;
   try {
     const b = await api('/api/bill/get', { id: id }, 'GET');
     $('#bl_info').innerHTML = `<div>账单 ${esc(b.bill_no)} · 状态 ${esc(b.status)}
       · 应收 ${esc(yuan(b.total_amount_fen))} 元 · 已收 ${esc(yuan(b.paid_amount_fen))} 元
       · 已退 ${esc(yuan(b.refunded_amount_fen))} 元</div>
-      <table><thead><tr><th>行</th><th>项目</th><th>来源</th><th>金额</th></tr></thead><tbody>${
+      <table><thead><tr><th>行</th><th>项目</th><th>来源</th><th>金额</th><th>操作</th></tr></thead><tbody>${
       (b.items || []).map(i => `<tr><td>${esc(i.line_no)}</td><td>${esc(i.name_snap)}</td>
-        <td>${esc(i.source_type)}#${esc(i.source_id)}</td><td>${esc(yuan(i.amount_fen))}</td></tr>`).join('')
-      || '<tr><td class="empty" colspan="4">无明细</td></tr>'}</tbody></table>
+        <td>${esc(i.source_type)}#${esc(i.source_id)}</td><td>${esc(yuan(i.amount_fen))}</td>
+        <td><button class="btn sm ghost" onclick="blItemRefund(${i.id}, this)">退款</button>
+            <button class="btn sm ghost" onclick="blItemReversal(${i.id}, this)">冲正</button></td></tr>`).join('')
+      || '<tr><td class="empty" colspan="5">无明细</td></tr>'}</tbody></table>
       <div class="hint">支付 ${esc((b.payments || []).length)} 笔 / 退款 ${esc((b.refunds || []).length)} 笔
         ${b.settlement_id ? ' · 已日结（锁定）' : ''}</div>`;
   } catch (e) { toast(e.message, 'err'); }
@@ -2654,6 +2872,40 @@ async function blPay() {
     });
     toast('收费成功：' + yuan(r.paid_amount_fen) + ' 元', 'ok');
     blLoad();
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+async function blItemRefund(itemId, btn) {
+  const name = btn ? btn.closest('tr').children[1].innerText : '本行';
+  const amt = prompt(`对「${name}」退款金额（元）：`, '');
+  if (amt === null) return;
+  const fen = Math.round(parseFloat(amt) * 100);
+  if (!fen || fen <= 0) { toast('金额不正确', 'err'); return; }
+  const reason = prompt('退款原因（必填）：', '患者要求退费');
+  if (!reason) { toast('必须填写退款原因', 'err'); return; }
+  try {
+    const r = await api('/api/refund/create', {
+      bill_id: Number(P3.billId), reason: reason,
+      items: [{ bill_item_id: itemId, amount_fen: fen }],
+    });
+    toast('退款成功：' + r.refund_no, 'ok'); blLoad();
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+async function blItemReversal(itemId, btn) {
+  const name = btn ? btn.closest('tr').children[1].innerText : '本行';
+  const amt = prompt(`对「${name}」冲正金额（元）：`, '');
+  if (amt === null) return;
+  const fen = Math.round(parseFloat(amt) * 100);
+  if (!fen || fen <= 0) { toast('金额不正确', 'err'); return; }
+  const reason = prompt('冲正原因（必填）：', '');
+  if (!reason) { toast('必须填写冲正原因', 'err'); return; }
+  try {
+    const r = await api('/api/reversal/create', {
+      bill_id: Number(P3.billId), reason: reason,
+      items: [{ bill_item_id: itemId, amount_fen: fen }],
+    });
+    toast('冲正成功：' + r.reversal_no, 'ok'); blLoad();
   } catch (e) { toast(e.message, 'err'); }
 }
 

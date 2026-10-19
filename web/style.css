@@ -102,3 +102,12 @@ tbody tr:hover { background: #f7fafd; }
 .empty { color: var(--muted); padding: 18px; text-align: center; }
 .section-title { font-weight: 700; margin: 14px 0 8px; font-size: 14px; border-left: 3px solid var(--primary); padding-left: 8px; }
 pre.log { background: #0f172a; color: #d7e0ee; padding: 10px; border-radius: 4px; max-height: 320px; overflow: auto; font-size: 12px; }
+
+/* 选择器 / 勾选项：就诊、处方、账单一律从下拉里选，不手填 ID */
+select.pick { min-width: 240px; max-width: 420px; }
+label.chk {
+  display: inline-flex; align-items: center; gap: 5px; margin: 0;
+  font-size: 13px; color: var(--text); cursor: pointer; white-space: nowrap;
+}
+label.chk input[type=checkbox] { width: auto; margin: 0; }
+.picker-hint { color: var(--muted); font-size: 12px; }

@@ -282,8 +282,9 @@ save_tcm_four = route("/api/record/save/tcm_four", "POST", perm="record.edit",
 @route("/api/record/create", "POST", perm="record.edit", module="M03", action="record.create")
 def create(ctx, body, q):
     require(body.get("visit_id"), "缺少 visit_id")
+    # 幂等接口：病历已存在时直接返回。审计由 API 层统一写，
+    # 这里不再重复写一条（重复写会在前端重复进入病历页时把审计表刷爆）。
     with db.tx() as conn:
-        audit.audit_operation(conn, "M03", "record.create", "record", None)
         rec = ensure_record(conn, body["visit_id"], ctx)
     return rec
 

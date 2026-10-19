@@ -138,7 +138,7 @@ def bootstrap(root, port=8787, open_browser=False, safe_mode_override=None,
         _httpd, url = api.serve(port=port, open_browser=open_browser)
         atexit.register(_atexit)
     report = {"checks": checks, "safe_mode": db.is_readonly(), "url": url,
-              "db_path": db_path, "version": "0.1.0-phase1"}
+              "db_path": db_path, "version": "1.0.0"}
     return _httpd, url, report
 
 
