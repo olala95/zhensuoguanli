@@ -95,6 +95,14 @@ def _count(table, where="", params=()):
     return _one("SELECT COUNT(*) c FROM %s %s" % (table, where), params)["c"]
 
 
+def _count_safe(table, where="", params=()):
+    """库已损坏时的读取：命中坏页会抛 E1003。返回 -1 而不是让整个演练崩掉。"""
+    try:
+        return _count(table, where, params)
+    except AppError:
+        return -1
+
+
 class PowerCut(Exception):
     """演练用：模拟进程在事务中被强制杀掉。"""
 
@@ -515,13 +523,15 @@ def main():
     n_patient_before = _count("patient")
     n_bill_before = _count("bill")
 
-    # 制造损坏：把主库文件中间几页写成垃圾
+    # 制造损坏：把主库文件中部一页写成垃圾（单页即可让 integrity_check 报错，
+    # 又不至于连审计表一起毁掉——否则"结论留痕""恢复有记录"都无从验证）
     db_path = db.path()
     size = os.path.getsize(db_path)
+    offset = (max(size // 2, 4096) // 4096) * 4096
     with open(db_path, "r+b") as fh:
-        fh.seek(max(size // 2, 4096))
-        fh.write(b"\x00CORRUPTED-BY-DRILL-08\x01" * 512)
-    print("  已注入损坏：%s（偏移 %d）" % (db_path, max(size // 2, 4096)))
+        fh.seek(offset)
+        fh.write(b"\x00CORRUPTED-BY-DRILL-08\x01" * 171)
+    print("  已注入损坏：%s（偏移 %d，1 页）" % (db_path, offset))
     # 进程内页缓存会盖住外部篡改，等价于真实场景的"重启后才发现"
     db.close_all()
     db.init(db_path)
@@ -535,15 +545,18 @@ def main():
         detected = True
         print("  完整性检查抛出异常（同样算发现）：%s %s" % (exc.code, exc.message))
     check("完整性检查发现损坏", detected, str(res and res.get("integrity_check")))
-    check("检查结论落表", _count("integrity_check", "WHERE result='FAIL'") >= 1)
+    check("检查结论有留痕（库记录或库外旁路证据）",
+          _count_safe("integrity_check", "WHERE result='FAIL'") >= 1
+          or bool((res or {}).get("evidence_file")),
+          str((res or {}).get("evidence_file")))
 
-    n_crash_before = _count("crash_recovery_log")
+    n_crash_before = _count_safe("crash_recovery_log")
     fr = m13.freeze_on_corruption("E1003", "演练 8：文件校验失败", ctx)
     check("怀疑损坏即冻结为只读", db.is_readonly() is True, str(fr))
-    check("冻结前留痕（崩溃日志）", _count("crash_recovery_log") > n_crash_before,
-          "%d → %d" % (n_crash_before, _count("crash_recovery_log")))
+    check("冻结前留痕（崩溃日志）", _count_safe("crash_recovery_log") > n_crash_before,
+          "%d → %d" % (n_crash_before, _count_safe("crash_recovery_log")))
     check("冻结写了高风险审计",
-          _count("audit_high_risk", "WHERE risk_type='DB_CORRUPT'") >= 1)
+          _count_safe("audit_high_risk", "WHERE risk_type='DB_CORRUPT'") >= 1)
     check("冻结期间禁止业务写入",
           expect_error("只读下写业务被拒",
                        lambda: m01.create(ctx, {"name": "不该写入", "gender": "M"}, {}),

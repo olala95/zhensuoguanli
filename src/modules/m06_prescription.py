@@ -1249,3 +1249,176 @@ def import_upsert(kind, rows):
             failed += 1
             errors.append({"line": i, "error": str(exc)})
     return len(rows), ok, failed, errors
+
+
+# ============================================================
+# 易用性：开方检索目录 + 一键载入常用中药（2026-10-20）
+#
+# 背景：新装的库里没有药品目录，医生开方搜"当归"搜不到，只能先手工建档，
+# 是"开方太麻烦"的第一道坎。这里提供：
+#   1) 全量目录接口：前端一次拉走做本地检索，输入即出候选（不再每敲一个字打一次接口）
+#   2) 一键载入：内置常用饮片 / 成药写入，**按正名去重，已存在的跳过，绝不覆盖**
+# ============================================================
+
+@route("/api/catalog/herbs", "GET", perm="herb.view", module="M06", action="catalog.herbs")
+def catalog_herbs(ctx, body, q):
+    """全量饮片目录（轻量字段），供前端本地检索 / 首字母匹配。"""
+    rows = db.query("""
+        SELECT id, herb_code, name, alias, pinyin, pinyin_initials,
+               price_milli_per_g, usual_dose_g, is_toxic, pregnancy_flag
+        FROM herb WHERE deleted_at IS NULL AND is_active=1
+        ORDER BY name
+    """)
+    return {"items": [dict(r) for r in rows], "count": len(rows)}
+
+
+@route("/api/catalog/drugs", "GET", perm="drug.view", module="M06", action="catalog.drugs")
+def catalog_drugs(ctx, body, q):
+    """全量成药目录（轻量字段）。"""
+    rows = db.query("""
+        SELECT id, drug_code, generic_name, trade_name, alias, pinyin, pinyin_initials,
+               spec, unit, price_fen, is_antibiotic, need_skin_test
+        FROM drug WHERE deleted_at IS NULL AND is_active=1
+        ORDER BY generic_name
+    """)
+    return {"items": [dict(r) for r in rows], "count": len(rows)}
+
+
+@route("/api/catalog/seed", "POST", perm="herb.manage", module="M06", action="catalog.seed")
+def catalog_seed(ctx, body, q):
+    """一键载入内置常用中药目录。幂等：按正名去重，已存在的跳过。
+
+    body: {kind: "herb"|"drug"|"all"}  默认 all
+    返回 {herb:{added,skipped}, drug:{added,skipped}}
+    """
+    from core import catalog_seed
+
+    kind = (body.get("kind") or "all").lower()
+    out = {}
+    now = tu.now_str()
+
+    if kind in ("all", "herb"):
+        added = skipped = 0
+        with db.tx() as conn:
+            audit.audit_operation(conn, "M06", "catalog.seed.herb", "herb", None)
+            seq = _seq_start(conn, "herb", "herb_code", "HS")
+            for name, pinyin, initials, price_yuan, dose, flag in catalog_seed.herbs():
+                # 关键：按**正名**去重。库里可能已有同名饮片（编目方式不同），
+                # 重复写入会让医生在候选里看到两个"黄芪"，反而更难选。
+                if _exists(conn, "herb", "name", name):
+                    skipped += 1
+                    continue
+                db.execute(conn, """
+                    INSERT INTO herb (herb_code, name, pinyin, pinyin_initials,
+                        price_milli_per_g, usual_dose_g, is_toxic, pregnancy_flag,
+                        stock_unit, is_active, created_at, created_by, updated_at, updated_by)
+                    VALUES (?,?,?,?,?,?,?,?,'g',1,?,?,?,?)
+                """, ("HS%04d" % seq, name, pinyin, initials,
+                      money.to_milli(price_yuan), dose,
+                      1 if "T" in flag else 0,
+                      "CONTRAINDICATED" if "P" in flag else None,
+                      now, ctx.user_id, now, ctx.user_id))
+                seq += 1
+                added += 1
+        out["herb"] = {"added": added, "skipped": skipped}
+
+    if kind in ("all", "drug"):
+        added = skipped = 0
+        with db.tx() as conn:
+            audit.audit_operation(conn, "M06", "catalog.seed.drug", "drug", None)
+            seq = _seq_start(conn, "drug", "drug_code", "DS")
+            for name, pinyin, initials, price_yuan, unit, spec in catalog_seed.drugs():
+                if _exists(conn, "drug", "generic_name", name):
+                    skipped += 1
+                    continue
+                db.execute(conn, """
+                    INSERT INTO drug (drug_code, generic_name, pinyin, pinyin_initials,
+                        spec, unit, price_fen, is_active, created_at, created_by,
+                        updated_at, updated_by)
+                    VALUES (?,?,?,?,?,?,?,1,?,?,?,?)
+                """, ("DS%04d" % seq, name, pinyin, initials, spec, unit,
+                      money.to_fen(price_yuan), now, ctx.user_id, now, ctx.user_id))
+                seq += 1
+                added += 1
+        out["drug"] = {"added": added, "skipped": skipped}
+
+    return out
+
+
+@route("/api/catalog/frequent", "GET", perm="herb.view", module="M06",
+       action="catalog.frequent")
+def catalog_frequent(ctx, body, q):
+    """开方常用品目（按历史开方次数排序），用于快捷面板一键加药。"""
+    kind = (q.get("kind") or "herb").lower()
+    try:
+        limit = max(1, min(int(q.get("limit") or 30), 100))
+    except ValueError:
+        limit = 30
+    if kind == "drug":
+        rows = db.query("""
+            SELECT d.id, d.generic_name AS name, d.pinyin_initials, d.unit, d.price_fen,
+                   COUNT(*) c, MAX(i.quantity) usual
+            FROM prescription_item i JOIN drug d ON d.id = i.drug_id
+            WHERE i.deleted_at IS NULL AND d.deleted_at IS NULL AND d.is_active=1
+            GROUP BY d.id ORDER BY c DESC, d.generic_name LIMIT ?
+        """, (limit,))
+    else:
+        rows = db.query("""
+            SELECT h.id, h.name, h.pinyin_initials, h.usual_dose_g AS usual,
+                   h.price_milli_per_g, COUNT(*) c
+            FROM herb_prescription_item i JOIN herb h ON h.id = i.herb_id
+            WHERE i.deleted_at IS NULL AND h.deleted_at IS NULL AND h.is_active=1
+            GROUP BY h.id ORDER BY c DESC, h.name LIMIT ?
+        """, (limit,))
+    return {"items": [dict(r) for r in rows]}
+
+
+@route("/api/catalog/cleanup_test", "POST", perm="herb.manage", module="M06",
+       action="catalog.cleanup_test")
+def catalog_cleanup_test(ctx, body, q):
+    """把自动化测试造出来的品目停用掉，避免它们混进开方候选里。
+
+    特征是名称形如 "M06黄芪" / "M07饮片" / "M10饮片B"（模块号 + 品类名）。
+    只置 is_active=0（软停用），不删数据 —— 随时可再启用，不做不可逆操作。
+    """
+    pats = ("M0%", "M1%")
+    out = {}
+    now = tu.now_str()
+    with db.tx() as conn:
+        audit.audit_operation(conn, "M06", "catalog.cleanup_test", "herb", None)
+        n = 0
+        for p in pats:
+            rows = db.execute(conn, "SELECT id, name FROM herb WHERE deleted_at IS NULL "
+                                    "AND is_active=1 AND name LIKE ?", (p,)).fetchall()
+            for r in rows:
+                db.execute(conn, "UPDATE herb SET is_active=0, updated_at=?, updated_by=? "
+                                 "WHERE id=?", (now, ctx.user_id, r["id"]))
+                n += 1
+        out["herb"] = n
+        n = 0
+        for p in pats:
+            rows = db.execute(conn, "SELECT id, generic_name FROM drug WHERE deleted_at IS NULL "
+                                    "AND is_active=1 AND generic_name LIKE ?", (p,)).fetchall()
+            for r in rows:
+                db.execute(conn, "UPDATE drug SET is_active=0, updated_at=?, updated_by=? "
+                                 "WHERE id=?", (now, ctx.user_id, r["id"]))
+                n += 1
+        out["drug"] = n
+    return out
+
+
+def _exists(conn, table, col, value):
+    """事务内查重：必须用同一个 conn，走独立读连接看不到本事务未提交的行。"""
+    cur = db.execute(conn, "SELECT id FROM %s WHERE %s=? AND deleted_at IS NULL"
+                     % (table, col), (value,))
+    return cur.fetchone() is not None
+
+
+def _seq_start(conn, table, col, prefix):
+    """同前缀编码的下一个序号。两位前缀（HS/DS）是为了和历史测试数据
+    （H1642249588 这类时间戳编码）隔开，否则 MAX 会被天文数字带跑。"""
+    cur = db.execute(conn, "SELECT MAX(CAST(SUBSTR(%s,%d) AS INTEGER)) m FROM %s "
+                           "WHERE %s LIKE ?" % (col, len(prefix) + 1, table, col),
+                     (prefix + "%",))
+    row = cur.fetchone()
+    return ((row["m"] if row and row["m"] else 0) or 0) + 1

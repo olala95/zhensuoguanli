@@ -22,29 +22,57 @@ _write_lock = threading.RLock()
 _local = threading.local()
 _db_path = None
 _readonly_mode = False
+_malformed = False      # 打开/PRAGMA 阶段就发现文件损坏（F95：不能让启动裸崩）
 _write_seq = 0          # 已提交写事务计数（F91：判断"上次备份后是否有变化"）
 
 
 def init(db_path, readonly=False):
-    """打开写连接并应用 PRAGMA。readonly=True 时为安全模式：禁止业务写。"""
-    global _write_conn, _db_path, _readonly_mode
+    """打开写连接并应用 PRAGMA。readonly=True 时为安全模式：禁止业务写。
+
+    库损坏时**不抛异常**：连接仍然打开（完整性检查还要靠它跑），只置 malformed 标记，
+    由启动自检进安全模式 + 冻结现场 + 引导从备份恢复。启动阶段裸崩会导致恢复链路
+    永远执行不到（故障演练 8）。
+    """
+    global _write_conn, _db_path, _readonly_mode, _malformed
     _db_path = db_path
     _readonly_mode = readonly
+    _malformed = False
     d = os.path.dirname(db_path)
     if d and not os.path.isdir(d):
         os.makedirs(d, exist_ok=True)
-    conn = sqlite3.connect(db_path, timeout=5.0, check_same_thread=False, isolation_level=None)
-    conn.row_factory = sqlite3.Row
+    try:
+        conn = sqlite3.connect(db_path, timeout=5.0, check_same_thread=False,
+                               isolation_level=None)
+        conn.row_factory = sqlite3.Row
+    except sqlite3.Error as exc:
+        _malformed = True
+        raise AppError(SYSTEM_DB_CORRUPT, "数据库文件无法打开：%s" % exc,
+                       retryable=False, http_status=500, detail={"raw": str(exc)})
     _apply_pragmas(conn)
     _write_conn = conn
     return conn
 
 
 def _apply_pragmas(conn):
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute("PRAGMA busy_timeout=5000")
-    conn.execute("PRAGMA foreign_keys=ON")
+    """应用 PRAGMA；返回是否全部成功。
+
+    journal_mode=WAL 需要读文件头，库损坏时会抛 DatabaseError——这里必须接住，
+    否则启动即崩。失败时置 malformed 标记并返回 False。
+    """
+    global _malformed
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+    except sqlite3.DatabaseError:
+        _malformed = True
+        return False
+    try:
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA foreign_keys=ON")
+    except sqlite3.Error:
+        _malformed = True
+        return False
+    return True
 
 
 def path():
@@ -53,6 +81,11 @@ def path():
 
 def is_readonly():
     return _readonly_mode
+
+
+def is_malformed():
+    """打开阶段是否发现文件损坏。恢复成功后由 init() 自动清掉。"""
+    return _malformed
 
 
 def write_seq():

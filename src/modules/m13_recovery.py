@@ -326,6 +326,37 @@ def _finish_restore(restore_no, src, ok, detail, ctx, row):
 
 # ---------------- F94 完整性检查 ----------------
 
+def _evidence_dir():
+    """完整性结论的库外目录：<root>/logs/integrity/。"""
+    p = db.path()
+    if not p:
+        return None
+    return os.path.join(os.path.dirname(os.path.dirname(p)), "logs", "integrity")
+
+
+def write_evidence(record):
+    """把检查结论写到库外的 jsonl 旁路文件。
+
+    库坏到连 INSERT 都写不进去时，结论不能随之消失——否则"检查"等于没做，
+    事后也无法回答"什么时候坏的、坏在哪"。文件留痕是最后一道证据。
+    """
+    d = _evidence_dir()
+    if not d:
+        return None
+    try:
+        os.makedirs(d, exist_ok=True)
+        fn = os.path.join(d, "integrity_%s.jsonl"
+                          % datetime.date.today().isoformat().replace("-", ""))
+        with open(fn, "a", encoding="utf-8") as fh:
+            fh.write(audit.dumps(record) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        return fn
+    except Exception:
+        log.exception("写完整性旁路证据失败")
+        return None
+
+
 def integrity_check_full(ctx=None):
     """F94：页结构 + 外键 + 业务不变量三层检查。"""
     from core import selftest
@@ -351,6 +382,12 @@ def integrity_check_full(ctx=None):
     if err:
         detail["layer_error"] = err
     duration = int((datetime.datetime.now() - t0).total_seconds() * 1000)
+    # 先写库外证据：这一步不依赖数据库能否写入
+    evidence = write_evidence({"checked_at": tu.now_str(), "check_type": "FULL",
+                                "target": db.path(), "result": "OK" if ok else "FAIL",
+                                "integrity_check": base["integrity_check"],
+                                "layer_error": err, "duration_ms": duration,
+                                "checked_by": ctx.user_id if ctx else None})
     try:
         with db.tx() as conn:
             db.execute(conn, """
@@ -364,7 +401,8 @@ def integrity_check_full(ctx=None):
         log.exception("完整性检查结果落表失败（库可能已损坏）")
     return {"integrity_check": base["integrity_check"],
             "foreign_key_violations": base["foreign_key_violations"],
-            "invariants": violations, "layer_error": err, "ok": ok}
+            "invariants": violations, "layer_error": err, "ok": ok,
+            "evidence_file": evidence}
 
 
 # ---------------- F95 SQLite 异常恢复 ----------------
@@ -375,9 +413,12 @@ def freeze_on_corruption(error_code, raw_message, ctx=None):
     **绝不**删除或改写原库文件，为后续 salvage / 恢复保留证据。
     """
     ctx = ctx or get_ctx()
-    # 先留痕（此刻仍可写），再冻结：否则只读后连审计都写不进去
+    # 留痕必须在"已冻结"之后也成立：启动路径是先置只读再调本函数，
+    # 所以用 force=True（恢复链路专用出口）。库真坏到写不进去时，
+    # 降级到库外证据文件——绝不让"冻结"这件事本身无据可查。
+    written = False
     try:
-        with db.tx() as conn:
+        with db.tx(force=True) as conn:
             db.execute(conn, """
                 INSERT INTO crash_recovery_log (detected_at, issue, action_taken, result,
                                                 detail_json)
@@ -389,10 +430,18 @@ def freeze_on_corruption(error_code, raw_message, ctx=None):
             audit.audit_high_risk(conn, "DB_CORRUPT", "database", None,
                                   "数据库异常，已冻结现场并进入只读",
                                   {"error_code": error_code, "raw": raw_message})
+            written = True
     except Exception:
         log.exception("写崩溃日志失败（异常绝不静默丢失，已进应用日志）")
+    evidence = None
+    if not written:
+        evidence = write_evidence({"kind": "FREEZE", "detected_at": tu.now_str(),
+                                    "error_code": error_code, "raw": raw_message,
+                                    "action_taken": "进入只读模式，保留现场等待人工恢复",
+                                    "result": "NEED_MANUAL_REVIEW"})
     db.set_readonly(True)
-    return {"readonly": True, "error_code": error_code,
+    return {"readonly": True, "error_code": error_code, "logged": written,
+            "evidence_file": evidence,
             "message": "数据库异常，已进入只读模式，请使用最近备份恢复"}
 
 

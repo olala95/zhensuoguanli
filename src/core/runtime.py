@@ -34,7 +34,14 @@ def bootstrap(root, port=8787, open_browser=False, safe_mode_override=None,
     log.info("=" * 60)
     log.info("系统启动 version=1.0.0 db=%s", db_path)
 
-    db.init(db_path)
+    # 库损坏时 init 不能崩：接住后走安全模式，让 F95 的冻结/恢复链路能执行到
+    db_broken = None
+    try:
+        db.init(db_path)
+        if db.is_malformed():
+            db_broken = "打开数据库时 PRAGMA 校验失败，文件疑似损坏"
+    except Exception as exc:
+        db_broken = "数据库无法打开：%s" % exc
     set_ctx(Context(source="SYSTEM"))
 
     migrate.init(os.path.join(root, "migrations"))
@@ -48,7 +55,16 @@ def bootstrap(root, port=8787, open_browser=False, safe_mode_override=None,
         log.exception("硬件驱动初始化失败（打印功能将不可用）")
 
     # 0) 快速闸门：绝不在损坏的库上跑迁移
-    gate_ok, gate_detail = selftest.quick_gate()
+    if db_broken:
+        gate_ok, gate_detail = False, db_broken
+    else:
+        try:
+            gate_ok, gate_detail = selftest.quick_gate()
+        except Exception as exc:
+            # integrity_check 本身也可能抛（坏库）——同样算闸门不通过
+            gate_ok, gate_detail = False, "完整性检查失败：%s" % exc
+    if db_broken:
+        log.error("数据库不可用，进入安全模式：%s", db_broken)
     if safe_mode_override is not None:
         db.set_readonly(bool(safe_mode_override))
     elif not gate_ok:
@@ -76,6 +92,16 @@ def bootstrap(root, port=8787, open_browser=False, safe_mode_override=None,
         log.error("进入安全模式（只读），禁止业务写入")
         checks = [{"item": "integrity_check", "result": "FAIL", "detail": gate_detail},
                   {"item": "migration", "result": "SKIPPED", "detail": "安全模式跳过迁移"}]
+        # 库坏到写不进自检表时，至少要有一份库外证据说明"何时、为何进的安全模式"
+        try:
+            from modules import m13_recovery
+            from . import timeutil as _tu
+            m13_recovery.write_evidence({"kind": "STARTUP_SAFE_MODE",
+                                         "checked_at": _tu.now_str(),
+                                         "check_type": "GATE", "result": "FAIL",
+                                         "detail": str(gate_detail)[:500]})
+        except Exception:
+            log.exception("写安全模式旁路证据失败")
     else:
         # 3) 迁移（执行前自动备份，05 §6）
         try:

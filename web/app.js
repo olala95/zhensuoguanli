@@ -308,10 +308,14 @@ async function fillRxSelect(selId, visitId) {
   try {
     const items = (await api('/api/prescription/list', { visit_id: visitId }, 'GET')).items || [];
     if (!items.length) { el.innerHTML = '<option value="">该就诊没有处方</option>'; return; }
-    el.innerHTML = '<option value="">— 选择处方 —</option>' + items.map(r => {
+    // 自动选中可发药的那一张（优先已确认未发药的），省掉「展开下拉再挑」这一步
+    const pick = items.find(r => r.status === 'CONFIRMED')
+      || items.find(r => ['DISPENSED', 'PARTIAL_RETURNED'].indexOf(r.status) >= 0)
+      || items[0];
+    el.innerHTML = items.map(r => {
       const label = [r.prescription_no, r.prescription_type === 'HERB' ? '中药' : '成药',
         r.status, yuan(r.total_amount) + '元'].filter(Boolean).join(' · ');
-      return `<option value="${r.id}">${esc(label)}</option>`;
+      return `<option value="${r.id}"${r.id === pick.id ? ' selected' : ''}>${esc(label)}</option>`;
     }).join('');
   } catch (e) {
     el.innerHTML = '<option value="">读取失败</option>';
@@ -474,6 +478,30 @@ async function startVisit(id) {
 /* ---------- 接诊工作台 / 病历 ---------- */
 let LAST_RECORD_ID = 0;
 
+/* 常用舌象 / 脉象 / 证型：点一下填进去，省掉中医门诊里最高频的那几次打字 */
+const TONGUE_BODY = ['淡红', '淡白', '淡胖', '红', '绛', '紫暗', '有齿痕', '有瘀点'];
+const TONGUE_COAT = ['薄白', '白腻', '白滑', '白厚', '黄腻', '黄厚', '少苔', '无苔', '剥苔'];
+const PULSE_OPTS = ['浮', '沉', '迟', '数', '弦', '滑', '涩', '细', '弱', '缓', '结代', '洪'];
+const SYNDROMES = ['气血两虚', '心脾两虚', '肝郁脾虚', '肝郁气滞', '脾虚湿盛', '脾胃虚寒',
+  '肝肾阴虚', '肺脾气虚', '痰湿内阻', '气滞血瘀', '肝阳上亢', '湿热内蕴',
+  '风寒束表', '风热犯肺', '肾阳不足', '心肾不交'];
+const TREAT_PRINCIPLE = ['补气养血', '健脾益气', '疏肝健脾', '清热利湿', '温中散寒',
+  '滋补肝肾', '活血化瘀', '化痰祛湿', '平肝潜阳', '益气固表', '养心安神', '疏风解表'];
+
+function tagChips(inputId, list) {
+  return `<div style="margin-top:4px;display:flex;flex-wrap:wrap;gap:4px">${
+    list.map(x => `<span class="btn sm ghost" style="margin:0" onclick="tagPick('${inputId}','${esc(x)}')">${esc(x)}</span>`).join('')
+  }</div>`;
+}
+function tagPick(inputId, v) {
+  const el = document.getElementById(inputId);
+  if (!el || el.disabled) return;
+  const cur = String(el.value || '').trim();
+  if (cur.split(/[,，、;；]/).map(s => s.trim()).filter(Boolean).indexOf(v) >= 0) return;
+  el.value = cur ? cur + '、' + v : v;
+  el.dispatchEvent(new Event('change', { bubbles: true }));
+}
+
 async function viewRecord(visitId) {
   let v, r;
   try {
@@ -525,8 +553,8 @@ async function viewRecord(visitId) {
     <div class="row">
       <span class="hint">${v.is_first_visit ? '初诊' : '复诊'} · 登记 ${fmtTime(v.registered_at)}</span>
       <span class="spacer"></span>
-      ${locked ? '<span class="tag warn">病历已确认，内容锁定</span>' : `<button class="btn" onclick="saveAll(${rid})">保存全部</button>
-        <button class="btn warn" onclick="showConfirm(${rid})">确认签名</button>`}
+      ${locked ? '<span class="tag warn">病历已确认，内容锁定</span>' : `<button class="btn ghost" onclick="saveAll(${rid})">保存</button>
+        <button class="btn warn" onclick="confirmFlow(${rid})">确认签名（先自动保存）</button>`}
       <button class="btn ghost" onclick="suspendVisit(${v.id})">挂单/留观</button>
       ${v.status === 'SUSPENDED' ? `<button class="btn ghost" onclick="resumeVisit(${v.id})">恢复接诊</button>` : ''}
       <button class="btn ghost" onclick="completeVisit(${v.id})">完成就诊</button>
@@ -535,8 +563,9 @@ async function viewRecord(visitId) {
   </div>
 
   <div class="card">
-    <div class="section-title">既往史 / 个人史 / 家族史（F12）</div>
-    <div class="row">
+    <details>
+    <summary class="section-title" style="cursor:pointer;display:list-item">既往史 / 个人史 / 家族史 / 过敏史（F12/F13）—— 没有可跳过</summary>
+    <div class="row" style="margin-top:8px">
       <select id="hs_type" style="width:120px" ${locked ? 'disabled' : ''}>
         <option value="PAST">既往史</option><option value="PERSONAL">个人史</option>
         <option value="FAMILY">家族史</option></select>
@@ -557,7 +586,7 @@ async function viewRecord(visitId) {
       ${locked ? '' : `<button class="btn sm" onclick="addAllergy(${rid})">添加</button>`}
     </div>
     <div class="hint">${(r.allergies || []).map(a => esc(a.allergen) + '（' + esc(a.severity || '') + '）').join('；') || '无'}</div>
-
+    </details>
     ${locked ? '' : `<div class="row" style="margin-top:6px">
       <button class="btn sm ghost" onclick="showRecordTpl(${rid})">套用病历模板</button>
       <button class="btn sm ghost" onclick="saveAsRecordTpl(${rid})">存为模板</button></div>`}
@@ -581,15 +610,20 @@ async function viewRecord(visitId) {
       <div><label>望（神色形态）</label><textarea id="tf_ins" ${locked ? 'disabled' : ''}>${esc(tf.inspection || '')}</textarea></div>
       <div><label>闻（声息气味）</label><textarea id="tf_aus" ${locked ? 'disabled' : ''}>${esc(tf.auscultation || '')}</textarea></div>
       <div><label>问（寒热汗出饮食二便）</label><textarea id="tf_int" ${locked ? 'disabled' : ''}>${esc(tf.interrogation || '')}</textarea></div>
-      <div><label>舌质</label><input id="tf_tb" value="${esc(tf.tongue_body || '')}" ${locked ? 'disabled' : ''}></div>
-      <div><label>舌苔</label><input id="tf_tc" value="${esc(tf.tongue_coating || '')}" ${locked ? 'disabled' : ''}></div>
-      <div><label>脉象</label><input id="tf_pd" value="${esc(tf.pulse_desc || '')}" ${locked ? 'disabled' : ''}></div>
+      <div><label>舌质</label><input id="tf_tb" value="${esc(tf.tongue_body || '')}" ${locked ? 'disabled' : ''}>
+        ${locked ? '' : tagChips('tf_tb', TONGUE_BODY)}</div>
+      <div><label>舌苔</label><input id="tf_tc" value="${esc(tf.tongue_coating || '')}" ${locked ? 'disabled' : ''}>
+        ${locked ? '' : tagChips('tf_tc', TONGUE_COAT)}</div>
+      <div><label>脉象</label><input id="tf_pd" value="${esc(tf.pulse_desc || '')}" ${locked ? 'disabled' : ''}>
+        ${locked ? '' : tagChips('tf_pd', PULSE_OPTS)}</div>
     </div>
 
     <div class="section-title tcm">辨证论治（F109）</div>
     <div class="grid3">
-      <div><label>证型</label><input id="syn_name" value="${esc((r.syndromes && r.syndromes[0] && r.syndromes[0].syndrome_name) || '')}" ${locked ? 'disabled' : ''}></div>
-      <div><label>治则</label><input id="syn_prin" value="${esc((r.syndromes && r.syndromes[0] && r.syndromes[0].treatment_principle) || '')}" ${locked ? 'disabled' : ''}></div>
+      <div><label>证型</label><input id="syn_name" value="${esc((r.syndromes && r.syndromes[0] && r.syndromes[0].syndrome_name) || '')}" ${locked ? 'disabled' : ''}>
+        ${locked ? '' : tagChips('syn_name', SYNDROMES)}</div>
+      <div><label>治则</label><input id="syn_prin" value="${esc((r.syndromes && r.syndromes[0] && r.syndromes[0].treatment_principle) || '')}" ${locked ? 'disabled' : ''}>
+        ${locked ? '' : tagChips('syn_prin', TREAT_PRINCIPLE)}</div>
       <div><label>治法/方剂</label><input id="syn_meth" value="${esc((r.syndromes && r.syndromes[0] && r.syndromes[0].treatment_method) || '')}" ${locked ? 'disabled' : ''}></div>
     </div>
 
@@ -601,7 +635,8 @@ async function viewRecord(visitId) {
     </div>
     <div class="hint">当前诊断：${dx}</div>
 
-    <div class="section-title">生命体征（F14）</div>
+    <details>
+    <summary class="section-title" style="cursor:pointer;display:list-item">生命体征 / 查体 / 辅助检查（F14-F16）—— 需要时展开</summary>
     <div class="grid3">
       <div><label>体温 ℃</label><input id="vs_t" value="${esc(vit.temperature_c || '')}" ${locked ? 'disabled' : ''}></div>
       <div><label>脉搏 次/分</label><input id="vs_p" value="${esc(vit.pulse || '')}" ${locked ? 'disabled' : ''}></div>
@@ -631,6 +666,7 @@ async function viewRecord(visitId) {
       <button class="btn ghost sm" onclick="showExamRefPicker(${rid},${v.id})">引用本次就诊的检验结果</button>
       <button class="btn ghost sm" onclick="refreshExamRefs(${rid})">刷新辅助检查</button>
     </div>`}
+    </details>
 
     <div class="section-title">医嘱（F18，不含药品）</div>
     <textarea id="orders" placeholder="每行一条，例：针灸 1 次" ${locked ? 'disabled' : ''}>${esc((r.orders || []).map(o => o.content).join('\n'))}</textarea>
@@ -800,7 +836,7 @@ async function arExport(rid) {
 
 function val(id) { const el = document.getElementById(id); return el ? el.value : ''; }
 
-async function saveAll(rid) {
+async function saveAll(rid, silent) {
   try {
     await api('/api/record/save/chief', { record_id: rid, content: val('cc_content'), duration: val('cc_duration') });
     await api('/api/record/save/present', { record_id: rid, content: val('pi_content'),
@@ -825,9 +861,16 @@ async function saveAll(rid) {
       items: val('exam') ? [{ section: 'GENERAL', content: val('exam') }] : [], replace: true });
     await api('/api/record/save/order', { record_id: rid,
       items: val('orders').split('\n').filter(s => s.trim()).map(s => ({ order_type: 'ADVICE', content: s.trim() })) });
-    toast('已保存', 'ok');
-    render();
-  } catch (e) { toast(e.message, 'err'); }
+    if (!silent) { toast('已保存', 'ok'); render(); }
+    return true;
+  } catch (e) { toast(e.message, 'err'); return false; }
+}
+
+/* 确认签名前自动先保存：少点一次按钮，也避免「改了内容没保存就签名」这种丢数据的坑 */
+async function confirmFlow(rid) {
+  const ok = await saveAll(rid, true);
+  if (!ok) return;
+  showConfirm(rid);
 }
 
 // ---------- F16 辅助检查 ----------
@@ -1026,10 +1069,257 @@ async function voidVisit(id) {
 /* ============================================================
    M06 开方（F32-F39 / F110-F113）
    ============================================================ */
-const RX_STATE = { visitId: 0, rxId: 0, rx: null, drugs: [], herbs: [],
-                   drugKw: '', herbKw: '', check: null,
-                   rxType: 'WEST', doses: '7', decoction: '', admin: '' };
+/* ============================================================
+   M06 开方 —— 连续录入模式（2026-10-20 易用性改造）
 
+   改造前的开方流程（实测 12 味方要 51 步）：
+     选就诊 → 建方 → 输关键词 → 点搜索 → 点药名 → prompt 弹窗填剂量
+     →（每味重复 4 步）→ 点「保存明细」→ 计价 → 预检 → 提交 → 确认
+
+   现在：目录一次拉全量放本地，输入即出候选，回车直接入库。
+     「黄芪 15」回车 = 1 步；「hq15」回车 = 1 步；整段方子粘贴 = 1 步。
+   没有 prompt，没有「保存明细」二次按钮 —— 加了就是存了。
+   ============================================================ */
+/* 默认饮片方：这是中医诊所，绝大多数处方是中药，不该每次都先切成「饮片方」 */
+const RX_STATE = { visitId: 0, rxId: 0, rx: null, lines: [],
+                   cand: [], candIdx: -1,
+                   rxType: 'HERB', doses: '7', decoction: '水煎',
+                   admin: '每日一剂，分两次温服' };
+const CAT = { herbs: [], drugs: [], freqHerb: [], freqDrug: [], at: 0, loading: false, err: '' };
+
+async function loadCatalog(force) {
+  if (!force && CAT.herbs.length && Date.now() - CAT.at < 600000) return CAT;
+  if (CAT.loading) return CAT;
+  CAT.loading = true;
+  try {
+    const [h, d, fh, fd] = await Promise.all([
+      api('/api/catalog/herbs', {}, 'GET').catch(() => ({ items: [] })),
+      api('/api/catalog/drugs', {}, 'GET').catch(() => ({ items: [] })),
+      api('/api/catalog/frequent', { kind: 'herb', limit: 36 }, 'GET').catch(() => ({ items: [] })),
+      api('/api/catalog/frequent', { kind: 'drug', limit: 18 }, 'GET').catch(() => ({ items: [] })),
+    ]);
+    CAT.herbs = h.items || []; CAT.drugs = d.items || [];
+    CAT.freqHerb = fh.items || []; CAT.freqDrug = fd.items || [];
+    CAT.at = Date.now();
+  } catch (e) { CAT.err = e.message || ''; } finally { CAT.loading = false; }
+  return CAT;
+}
+
+/* 匹配打分：正名 > 首字母 > 全拼 > 前缀 > 包含 */
+function catScore(item, kw, isHerb) {
+  const name = (isHerb ? item.name : item.generic_name) || '';
+  const py = (item.pinyin || '').toLowerCase();
+  const ini = (item.pinyin_initials || '').toLowerCase();
+  const k = String(kw || '').toLowerCase();
+  if (!k) return 0;
+  const n = name.toLowerCase();
+  if (n === k) return 100;
+  if (ini === k) return 92;
+  if (py === k) return 88;
+  if (n.indexOf(k) === 0) return 70;
+  if (ini.indexOf(k) === 0) return 62;
+  if (py.indexOf(k) === 0) return 55;
+  if (n.indexOf(k) > 0) return 40;
+  if (ini.indexOf(k) > 0) return 30;
+  if (py.indexOf(k) > 0) return 22;
+  return 0;
+}
+
+/* 解析一行录入："黄芪 15" / "黄芪15" / "hq 15" / "黄芪" */
+function rxParse(raw) {
+  const s = String(raw == null ? '' : raw).replace(/[，,、]/g, ' ').trim();
+  if (!s) return null;
+  const m = s.match(/^(.*?)[\s]*(\d+(?:\.\d+)?)$/);
+  if (m && m[1].trim()) return { name: m[1].trim(), dose: parseFloat(m[2]) };
+  return { name: s, dose: null };
+}
+
+function rxIsHerb() {
+  return !!(RX_STATE.rx && RX_STATE.rx.prescription_type !== 'WEST');
+}
+
+function rxFind(raw) {
+  const p = rxParse(raw);
+  if (!p) return null;
+  const isHerb = rxIsHerb();
+  const pool = isHerb ? CAT.herbs : CAT.drugs;
+  const scored = [];
+  for (const x of pool) {
+    const s = catScore(x, p.name, isHerb);
+    if (s > 0) scored.push({ x: x, s: s });
+  }
+  scored.sort((a, b) => b.s - a.s);
+  if (!scored.length) return null;
+  const hit = scored[0].x;
+  const dose = p.dose || (isHerb ? (hit.usual_dose_g || 15) : 1);
+  return { hit: hit, dose: dose, name: isHerb ? hit.name : hit.generic_name,
+           ambiguous: scored.length > 1 && scored[1].s === scored[0].s };
+}
+
+function rxPush(hit, dose) {
+  const isHerb = rxIsHerb();
+  RX_STATE.lines.push(isHerb
+    ? { herb_id: hit.id, dose_g: Number(dose) || hit.usual_dose_g || 15, foot_note: 'NORMAL' }
+    : { drug_id: hit.id, quantity: Number(dose) || 1, dosage: '按医嘱',
+        frequency: 'tid', route: 'PO', days: 3 });
+}
+
+/* 立即落库：后端 save/herbs 与 save/items 都是整方覆盖，
+   所以每次增删改都要把完整 lines 发一遍 —— 前端 lines 就是唯一事实来源。 */
+async function rxCommit(msg) {
+  const rx = RX_STATE.rx;
+  if (!rx) return false;
+  const isHerb = rxIsHerb();
+  try {
+    if (isHerb) {
+      await api('/api/prescription/save/herbs', {
+        prescription_id: rx.id, items: RX_STATE.lines,
+        doses: parseInt(RX_STATE.doses, 10) || 7,
+        decoction_method: RX_STATE.decoction || '水煎',
+        administration: RX_STATE.admin || '每日一剂，分两次温服',
+      });
+    } else {
+      await api('/api/prescription/save/items', {
+        prescription_id: rx.id, items: RX_STATE.lines });
+    }
+    if (msg) toast(msg, 'ok');
+    await rxRender();
+    return true;
+  } catch (e) { toast(e.message, 'err'); return false; }
+}
+
+async function rxAddOne(raw) {
+  await loadCatalog();
+  const f = rxFind(raw);
+  if (!f) { toast('目录里找不到「' + String(raw || '').trim() + '」', 'err'); return false; }
+  rxPush(f.hit, f.dose);
+  return await rxCommit('已加入 ' + f.name + ' ' + f.dose + (rxIsHerb() ? ' g' : ''));
+}
+
+async function rxBatchAdd() {
+  const el = document.getElementById('rx_batch');
+  if (!el) return;
+  const rows = String(el.value || '').split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+  if (!rows.length) { toast('请先粘贴方子内容', 'err'); return; }
+  await loadCatalog();
+  let ok = 0; const miss = [];
+  for (const r of rows) {
+    const f = rxFind(r);
+    if (!f) { miss.push(r); continue; }
+    rxPush(f.hit, f.dose); ok++;
+  }
+  el.value = '';
+  if (ok) await rxCommit('批量加入 ' + ok + ' 味' + (miss.length ? '，' + miss.length + ' 味未找到' : ''));
+  else toast('一行都没匹配上：' + miss.slice(0, 5).join('、'), 'err');
+}
+
+async function rxDose(i, v) {
+  const n = parseFloat(v);
+  if (!n || n <= 0) { toast('剂量必须大于 0', 'err'); await rxRender(); return; }
+  const isHerb = rxIsHerb();
+  if (isHerb) RX_STATE.lines[i].dose_g = n; else RX_STATE.lines[i].quantity = n;
+  await rxCommit('');
+}
+
+async function rxDel(i) {
+  RX_STATE.lines.splice(i, 1);
+  await rxCommit('已删除');
+}
+
+async function rxMove(i, d) {
+  const j = i + d;
+  if (j < 0 || j >= RX_STATE.lines.length) return;
+  const t = RX_STATE.lines[i]; RX_STATE.lines[i] = RX_STATE.lines[j]; RX_STATE.lines[j] = t;
+  await rxCommit('');
+}
+
+function rxFieldChanged() {
+  RX_STATE.doses = val('rx_doses');
+  RX_STATE.decoction = val('rx_decoction');
+  RX_STATE.admin = val('rx_admin');
+}
+
+/* ---------- 候选下拉 ---------- */
+function rxCandRender() {
+  const box = document.getElementById('rx_cand');
+  if (!box) return;
+  if (!RX_STATE.cand.length) { box.innerHTML = ''; box.style.display = 'none'; return; }
+  const isHerb = rxIsHerb();
+  box.style.display = 'block';
+  box.innerHTML = RX_STATE.cand.map((c, i) => {
+    const nm = isHerb ? c.x.name : c.x.generic_name;
+    const extra = isHerb
+      ? ((c.x.usual_dose_g ? '常用 ' + c.x.usual_dose_g + 'g' : '') +
+         (c.x.is_toxic ? ' <b class="warn">毒</b>' : ''))
+      : ((c.x.spec || '') + ' ' + ((c.x.price_fen || 0) / 100).toFixed(2) + '元');
+    return `<div class="cand${i === RX_STATE.candIdx ? ' on' : ''}"
+      onmousedown="rxCandPick(${i})">${esc(nm)}
+      <span class="hint">${esc(String(extra || ''))}</span></div>`;
+  }).join('');
+}
+
+async function rxCandPick(i) {
+  const c = RX_STATE.cand[i];
+  if (!c) return;
+  const isHerb = rxIsHerb();
+  const dose = isHerb ? (c.x.usual_dose_g || 15) : 1;
+  rxPush(c.x, dose);
+  const el = document.getElementById('rx_fast');
+  if (el) el.value = '';
+  RX_STATE.cand = []; RX_STATE.candIdx = -1;
+  await rxCommit('已加入 ' + (isHerb ? c.x.name : c.x.generic_name) + ' ' + dose);
+  const e2 = document.getElementById('rx_fast');
+  if (e2) e2.focus();
+}
+
+async function rxFastInput(v) {
+  await loadCatalog();
+  const p = rxParse(v);
+  if (!p || !p.name) { RX_STATE.cand = []; rxCandRender(); return; }
+  const isHerb = rxIsHerb();
+  const pool = isHerb ? CAT.herbs : CAT.drugs;
+  const scored = [];
+  for (const x of pool) {
+    const s = catScore(x, p.name, isHerb);
+    if (s > 0) scored.push({ x: x, s: s });
+  }
+  scored.sort((a, b) => b.s - a.s);
+  RX_STATE.cand = scored.slice(0, 12);
+  RX_STATE.candIdx = RX_STATE.cand.length ? 0 : -1;
+  rxCandRender();
+}
+
+function rxFastKey(ev) {
+  if (ev.key === 'ArrowDown') {
+    if (RX_STATE.cand.length) {
+      RX_STATE.candIdx = (RX_STATE.candIdx + 1) % RX_STATE.cand.length; rxCandRender();
+    }
+    ev.preventDefault(); return false;
+  }
+  if (ev.key === 'ArrowUp') {
+    if (RX_STATE.cand.length) {
+      RX_STATE.candIdx = (RX_STATE.candIdx - 1 + RX_STATE.cand.length) % RX_STATE.cand.length;
+      rxCandRender();
+    }
+    ev.preventDefault(); return false;
+  }
+  if (ev.key === 'Enter') {
+    const raw = val('rx_fast');
+    if (RX_STATE.cand.length && RX_STATE.candIdx >= 0 && !rxParse(raw).dose) {
+      rxCandPick(RX_STATE.candIdx);
+    } else {
+      rxAddOne(raw);
+      const el = document.getElementById('rx_fast');
+      if (el) el.value = '';
+      RX_STATE.cand = []; rxCandRender();
+    }
+    ev.preventDefault(); return false;
+  }
+  if (ev.key === 'Escape') { RX_STATE.cand = []; rxCandRender(); return false; }
+  return true;
+}
+
+/* ---------- 页面骨架 ---------- */
 async function viewPrescribe() {
   try { await loadVisitChoices(); } catch (e) { }
   return `
@@ -1053,9 +1343,40 @@ async function rxPickVisit() {
   if (!RX_STATE.visitId) { $('#rx_body').innerHTML = '<div class="hint">选择就诊后载入该就诊的处方。</div>'; return; }
   await rxLoad();
 }
+
+function rxSeedBanner() {
+  const real = CAT.herbs.filter(h => !/^M\d/.test(h.name || '')).length;
+  if (real >= 20) return '';
+  return `<div class="row" style="margin-top:8px;padding:8px;border:1px solid #e0b34a;border-radius:6px;background:#fff8e6">
+    <span style="flex:1">目录里只有 ${real} 味饮片，开方搜不到药。
+      点「一键载入」写入 ${'228'} 味常用中药（含拼音首字母、常用量、参考价）。</span>
+    <button class="btn sm" onclick="rxSeed()">一键载入常用中药</button>
+    <button class="btn sm ghost" onclick="rxCleanupTest()">清理测试品目</button>
+  </div>`;
+}
+
+async function rxSeed() {
+  try {
+    const r = await api('/api/catalog/seed', { kind: 'all' });
+    toast('已载入：饮片 ' + (r.herb ? r.herb.added : 0) + ' 味，成药 ' + (r.drug ? r.drug.added : 0) + ' 种', 'ok');
+    await loadCatalog(true);
+    await rxLoad();
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+async function rxCleanupTest() {
+  try {
+    const r = await api('/api/catalog/cleanup_test', {});
+    toast('已停用测试品目：饮片 ' + (r.herb || 0) + ' 味，成药 ' + (r.drug || 0) + ' 种（可再启用）', 'ok');
+    await loadCatalog(true);
+    await rxLoad();
+  } catch (e) { toast(e.message, 'err'); }
+}
+
 async function rxLoad() {
   RX_STATE.visitId = parseInt(val('rx_visit')) || RX_STATE.visitId || 0;
   if (!RX_STATE.visitId) { toast('请选择就诊', 'err'); return; }
+  await loadCatalog();
   try {
     const v = await api('/api/visit/get', { id: RX_STATE.visitId }, 'GET');
     const list = (await api('/api/prescription/list', { visit_id: RX_STATE.visitId }, 'GET')).items || [];
@@ -1065,7 +1386,7 @@ async function rxLoad() {
       <td>${statusTag(r.status)}</td>
       <td>${r.total_amount != null ? (r.total_amount / 100).toFixed(2) + ' 元' : '-'}</td>
       <td>
-        <button class="btn sm ghost" onclick="rxOpen(${r.id})">编辑</button>
+        <button class="btn sm" onclick="rxOpen(${r.id})">编辑</button>
         <button class="btn sm ghost" onclick="rxCheck(${r.id})">规则预检</button>
         <button class="btn sm ghost" onclick="rxPrint(${r.id})">打印处方笺</button>
         ${['DRAFT', 'PENDING', 'CONFIRMED'].includes(r.status)
@@ -1076,24 +1397,26 @@ async function rxLoad() {
         <div class="k">患者</div><div>${esc(v.patient_name || '')} ${esc(v.patient_no || '')}</div>
         <div class="k">就诊</div><div>${esc(v.visit_no)} ${statusTag(v.status)}</div>
       </div>
+      ${rxSeedBanner()}
       <div class="section-title" style="margin-top:12px">新建处方</div>
-      ${rxCatalogForm()}
       <div class="row">
-        <select id="rx_type" style="width:150px" onchange="rxTypeChanged(this.value)">
-          <option value="WEST"${(RX_STATE.rxType || 'WEST') === 'WEST' ? ' selected' : ''}>成药方</option>
-          <option value="HERB"${RX_STATE.rxType === 'HERB' ? ' selected' : ''}>饮片方（中药）</option>
-          <option value="GRANULE"${RX_STATE.rxType === 'GRANULE' ? ' selected' : ''}>颗粒方</option></select>
-        <input id="rx_doses" placeholder="付数（饮片）" style="width:110px" value="${esc(RX_STATE.doses || '7')}">
-        <input id="rx_decoction" placeholder="煎法，如：水煎" style="flex:1" value="${esc(RX_STATE.decoction || '')}">
-        <input id="rx_admin" placeholder="服法，如：每日一剂分两次温服" style="flex:1" value="${esc(RX_STATE.admin || '')}">
+        <select id="rx_type" style="width:150px">
+          <option value="HERB"${(RX_STATE.rxType || 'HERB') === 'HERB' ? ' selected' : ''}>饮片方（中药）</option>
+          <option value="GRANULE"${RX_STATE.rxType === 'GRANULE' ? ' selected' : ''}>颗粒方</option>
+          <option value="WEST"${RX_STATE.rxType === 'WEST' ? ' selected' : ''}>成药方</option></select>
+        <input id="rx_doses" placeholder="付数" style="width:80px" value="${esc(RX_STATE.doses || '7')}" onchange="rxFieldChanged()">
+        <input id="rx_decoction" placeholder="煎法：水煎" style="flex:1" value="${esc(RX_STATE.decoction || '水煎')}" onchange="rxFieldChanged()">
+        <input id="rx_admin" placeholder="服法：每日一剂分两次温服" style="flex:1" value="${esc(RX_STATE.admin || '')}" onchange="rxFieldChanged()">
         <button class="btn" onclick="rxCreate()">建方</button>
       </div>
-      <div class="hint" id="rx_type_hint">将创建：${RX_STATE.rxType === 'HERB' ? '<b>饮片方（中药）</b>'
-        : (RX_STATE.rxType === 'GRANULE' ? '<b>颗粒方</b>' : '<b>成药方</b>')}</div>
+      ${rxCatalogForm()}
       <div class="section-title" style="margin-top:12px">本就诊处方（${list.length}）</div>
       <table class="tbl"><thead><tr><th>处方号</th><th>类型</th><th>状态</th><th>金额</th><th>操作</th></tr></thead>
       <tbody>${rows || '<tr><td colspan="5" class="hint">无</td></tr>'}</tbody></table>
       <div id="rx_editor"></div>`;
+    // 建方后不重建整块，避免把刚选的类型冲掉
+    const ts = document.getElementById('rx_type');
+    if (ts) ts.onchange = function () { rxTypeChanged(this.value); };
   } catch (e) { toast(e.message, 'err'); }
 }
 
@@ -1102,126 +1425,149 @@ function rxTypeChanged(v) {
   const el = document.getElementById('rx_type_hint');
   if (el) {
     el.innerHTML = '将创建：' + (v === 'HERB' ? '<b>饮片方（中药）</b>'
-      : (v === 'GRANULE' ? '<b>颗粒方</b>' : '<b>成药方</b>'));
+      : v === 'GRANULE' ? '<b>颗粒方</b>' : '<b>成药方</b>');
   }
 }
 
 async function rxCreate() {
   const t = val('rx_type') || RX_STATE.rxType || 'WEST';
   RX_STATE.rxType = t;
-  // 建方后会重建表单，先把当前输入记住，避免付数/煎法/服法被重置
-  RX_STATE.doses = val('rx_doses');
-  RX_STATE.decoction = val('rx_decoction');
-  RX_STATE.admin = val('rx_admin');
+  RX_STATE.doses = val('rx_doses') || RX_STATE.doses;
+  RX_STATE.decoction = val('rx_decoction') || RX_STATE.decoction;
+  RX_STATE.admin = val('rx_admin') || RX_STATE.admin;
   try {
     const r = await api('/api/prescription/create', {
       visit_id: RX_STATE.visitId, prescription_type: t,
-      doses: t === 'WEST' ? null : (parseInt(val('rx_doses')) || 7),
-      decoction_method: val('rx_decoction') || null,
-      administration: val('rx_admin') || null });
-    toast('已建方 ' + r.prescription_no + '（' +
-      (t === 'HERB' ? '饮片方' : t === 'GRANULE' ? '颗粒方' : '成药方') + '）', 'ok');
-    await rxLoad(); await rxOpen(r.id);
+      doses: t === 'WEST' ? null : (parseInt(RX_STATE.doses, 10) || 7),
+      decoction_method: RX_STATE.decoction || null,
+      administration: RX_STATE.admin || null });
+    toast('已建方 ' + r.prescription_no, 'ok');
+    await rxLoad();
+    await rxOpen(r.id);
   } catch (e) { toast(e.message, 'err'); }
 }
 
 async function rxOpen(id) {
   RX_STATE.rxId = id;
+  await loadCatalog();
   try {
     const rx = await api('/api/prescription/get', { id: id }, 'GET');
     RX_STATE.rx = rx;
     const isHerb = rx.prescription_type !== 'WEST';
-    const items = isHerb ? (rx.herbs || []) : (rx.items || []);
-    const rows = items.map((it, i) => `<tr>
+    const src = isHerb ? (rx.herbs || []) : (rx.items || []);
+    RX_STATE.lines = src.map(it => isHerb
+      ? { herb_id: it.herb_id, dose_g: it.dose_g, foot_note: it.foot_note || 'NORMAL' }
+      : { drug_id: it.drug_id, quantity: it.quantity, dosage: it.dosage || '按医嘱',
+          frequency: it.frequency || 'tid', route: it.route || 'PO', days: it.days || 3 });
+    if (rx.doses) RX_STATE.doses = String(rx.doses);
+    if (rx.decoction_method) RX_STATE.decoction = rx.decoction_method;
+    if (rx.administration) RX_STATE.admin = rx.administration;
+    await rxRender();
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+function rxNameOf(line, isHerb) {
+  const pool = isHerb ? CAT.herbs : CAT.drugs;
+  const id = isHerb ? line.herb_id : line.drug_id;
+  const hit = pool.find(x => x.id === id);
+  return hit ? (isHerb ? hit.name : hit.generic_name) : ('#' + id);
+}
+
+async function rxRender() {
+  const box = document.getElementById('rx_editor');
+  if (!box) return;
+  const rx = RX_STATE.rx;
+  if (!rx) { box.innerHTML = ''; return; }
+  const isHerb = rxIsHerb();
+  const locked = !['DRAFT', 'PENDING'].includes(rx.status);
+  const rows = RX_STATE.lines.map((it, i) => {
+    const nm = rxNameOf(it, isHerb);
+    const hit = (isHerb ? CAT.herbs : CAT.drugs).find(x => x.id === (isHerb ? it.herb_id : it.drug_id));
+    const tox = isHerb && hit && hit.is_toxic;
+    return `<tr>
       <td>${i + 1}</td>
-      <td>${esc(it.drug_name_snap || it.herb_name_snap || (isHerb ? it.herb_name : it.drug_name) || '')}</td>
-      <td>${isHerb ? (it.dose_g + ' g') : (it.quantity + ' ' + (it.unit || ''))}</td>
-      <td>${esc(it.foot_note || it.dosage || '')}</td>
-      <td>${esc(isHerb ? '' : (it.frequency || ''))}</td>
-      <td>${it.amount_fen != null ? (it.amount_fen / 100).toFixed(2) : '-'}</td>
-    </tr>`).join('');
-    $('#rx_editor').innerHTML = `
-      <div class="section-title">编辑 ${esc(rx.prescription_no)} ${statusTag(rx.status)}</div>
-      <table class="tbl"><thead><tr><th>#</th><th>名称</th><th>用量</th><th>${isHerb ? '脚注' : '用法'}</th><th>${isHerb ? '' : '频次'}</th><th>金额</th></tr></thead>
-      <tbody>${rows || '<tr><td colspan="6" class="hint">暂无明细</td></tr>'}</tbody></table>
+      <td>${esc(nm)}${tox ? ' <b class="warn" title="毒性饮片">毒</b>' : ''}</td>
+      <td><input class="dose" style="width:74px" value="${isHerb ? it.dose_g : it.quantity}"
+           onchange="rxDose(${i}, this.value)" ${locked ? 'disabled' : ''}>
+           <span class="hint">${isHerb ? 'g' : (hit && hit.unit) || ''}</span></td>
+      <td class="hint">${isHerb ? (hit && hit.usual_dose_g ? '常用 ' + hit.usual_dose_g + 'g' : '') : (hit && hit.spec) || ''}</td>
+      <td>${locked ? '' : `<button class="btn sm ghost" onclick="rxMove(${i},-1)" title="上移">↑</button>
+        <button class="btn sm ghost" onclick="rxMove(${i},1)" title="下移">↓</button>
+        <button class="btn sm warn" onclick="rxDel(${i})">删</button>`}</td>
+    </tr>`;
+  }).join('');
 
-      <div class="row" style="margin-top:8px">
-        <input id="rx_kw" style="flex:1" placeholder="${isHerb ? '搜饮片，如：黄芪' : '搜药品，如：布洛芬'}"
-               value="${esc(isHerb ? RX_STATE.herbKw : RX_STATE.drugKw)}">
-        <button class="btn ghost sm" onclick="rxSearch()">搜索</button>
+  const freq = isHerb ? CAT.freqHerb : CAT.freqDrug;
+  const freqHtml = freq.length ? freq.map(f =>
+    `<span class="btn sm ghost" style="margin:2px" onclick="rxFreqAdd(${f.id},${isHerb ? (f.usual || 15) : 1})">${esc(f.name)}</span>`
+  ).join('') : '<span class="hint">还没有历史处方，开过方后这里会自动长出常用药</span>';
+
+  box.innerHTML = `
+    <div class="section-title">编辑 ${esc(rx.prescription_no)} ${statusTag(rx.status)}
+      ${isHerb ? '（饮片方）' : '（成药方）'}</div>
+
+    ${locked ? '' : `
+    <div class="row" style="margin-top:6px;position:relative">
+      <input id="rx_fast" style="flex:1" autocomplete="off" placeholder="输入药名或拼音首字母，回车直接加入。例：黄芪 15 / 当归12 / hq15"
+             oninput="rxFastInput(this.value)" onkeydown="return rxFastKey(event)">
+      <button class="btn" onclick="rxAddOne(val('rx_fast'));document.getElementById('rx_fast').value=''">加入</button>
+    </div>
+    <div id="rx_cand" class="cand-box" style="display:none"></div>
+    <div class="hint">支持：中文名 / 拼音全拼 / 首字母，带不带剂量都行（不写剂量自动取常用量）。↑↓ 选候选，回车确认。</div>
+
+    <details style="margin-top:6px"><summary class="hint">整段粘贴方子（一行一味）</summary>
+      <textarea id="rx_batch" style="width:100%;height:110px;margin-top:6px"
+        placeholder="黄芪 30&#10;当归 15&#10;党参 15&#10;白术 12"></textarea>
+      <div class="row" style="margin-top:6px">
+        <button class="btn sm" onclick="rxBatchAdd()">批量加入</button>
+        <span class="hint">适合把纸质方子 / 旧系统里的方子一次粘进来</span>
       </div>
-      <div id="rx_results" class="hint"></div>
+    </details>
 
-      <div class="row" style="margin-top:10px">
-        <button class="btn ghost" onclick="rxPrice(${id})">计价</button>
-        <button class="btn ghost" onclick="rxCheck(${id})">规则预检</button>
-        ${['DRAFT'].includes(rx.status) ? `<button class="btn" onclick="rxSubmit(${id})">提交</button>` : ''}
-        ${['PENDING'].includes(rx.status) ? `<button class="btn warn" onclick="rxConfirm(${id})">确认（需口令）</button>` : ''}
-        ${['DRAFT', 'PENDING'].includes(rx.status) ? `<button class="btn ghost" onclick="rxSaveLines(${id})">保存明细</button>` : ''}
-        ${['DRAFT'].includes(rx.status) ? `<button class="btn sm ghost" onclick="rxTplApply(${id})">套用模板</button>` : ''}
-        <button class="btn sm ghost" onclick="rxTplCreate()">新建模板</button>
-        <button class="btn sm ghost" onclick="rxSaveAsTpl(${id})">存为模板</button>
-        <button class="btn sm ghost" onclick="rxGuide(${id})">用药指导</button>
-      </div>
-      <div id="rx_msg" class="hint"></div>`;
-  } catch (e) { toast(e.message, 'err'); }
+    <div class="section-title" style="margin-top:10px">常用${isHerb ? '饮片' : '药品'}（点一下加入）</div>
+    <div>${freqHtml}</div>`}
+
+    <table class="tbl" style="margin-top:10px">
+      <thead><tr><th>#</th><th>名称</th><th>用量</th><th>参考</th><th>${locked ? '' : '操作'}</th></tr></thead>
+      <tbody>${rows || '<tr><td colspan="5" class="hint">还没有明细，在上面的输入框里直接打字</td></tr>'}</tbody>
+    </table>
+
+    ${isHerb ? `<div class="row" style="margin-top:8px">
+      <span class="hint">付数</span>
+      <input id="rx_doses" style="width:70px" value="${esc(RX_STATE.doses || '7')}" onchange="rxFieldChanged();rxCommit('付数已保存')" ${locked ? 'disabled' : ''}>
+      <input id="rx_decoction" placeholder="煎法" style="flex:1" value="${esc(RX_STATE.decoction || '')}" onchange="rxFieldChanged();rxCommit('煎法已保存')" ${locked ? 'disabled' : ''}>
+      <input id="rx_admin" placeholder="服法" style="flex:1" value="${esc(RX_STATE.admin || '')}" onchange="rxFieldChanged();rxCommit('服法已保存')" ${locked ? 'disabled' : ''}>
+    </div>` : ''}
+
+    <div class="row" style="margin-top:10px">
+      <button class="btn ghost" onclick="rxPrice(${rx.id})">计价</button>
+      <button class="btn ghost" onclick="rxCheck(${rx.id})">规则预检</button>
+      ${rx.status === 'DRAFT' ? `<button class="btn" onclick="rxSubmit(${rx.id})">提交</button>` : ''}
+      ${rx.status === 'PENDING' ? `<button class="btn warn" onclick="rxConfirm(${rx.id})">确认（需口令）</button>` : ''}
+      ${rx.status === 'DRAFT' ? `<button class="btn sm ghost" onclick="rxTplApply(${rx.id})">套用模板</button>` : ''}
+      <button class="btn sm ghost" onclick="rxSaveAsTpl(${rx.id})">存为模板</button>
+      <button class="btn sm ghost" onclick="rxGuide(${rx.id})">用药指导</button>
+    </div>
+    <div id="rx_msg" class="hint"></div>`;
 }
 
-async function rxSearch() {
-  const rx = RX_STATE.rx; if (!rx) return;
-  const kw = val('rx_kw'); if (!kw) return;
-  const isHerb = rx.prescription_type !== 'WEST';
-  try {
-    const r = isHerb
-      ? await api('/api/herb/search', { keyword: kw }, 'GET')
-      : await api('/api/drug/search', { keyword: kw }, 'GET');
-    const items = r.items || [];
-    $('#rx_results').innerHTML = items.length
-      ? items.map(x => `<span class="btn sm ghost" style="margin:2px"
-          onclick="rxAddLine(${x.id},'${esc(isHerb ? (x.name || '') : (x.generic_name || ''))}')">${esc(isHerb ? x.name : x.generic_name)}</span>`).join('')
-      : '无匹配';
-  } catch (e) { toast(e.message, 'err'); }
-}
-
-function rxAddLine(id, name) {
-  const rx = RX_STATE.rx; if (!rx) return;
-  const isHerb = rx.prescription_type !== 'WEST';
-  const dose = prompt((isHerb ? '每味剂量（克）' : '数量') + '：' + name, isHerb ? '15' : '1');
-  if (dose === null) return;
-  const row = isHerb
-    ? { herb_id: id, dose_g: parseFloat(dose) || 0, foot_note: 'NORMAL' }
-    : { drug_id: id, quantity: parseFloat(dose) || 0, dosage: '按医嘱',
-        frequency: 'tid', route: 'PO', days: 3 };
-  (isHerb ? RX_STATE.herbs : RX_STATE.drugs).push(row);
-  toast('已加入待保存明细：' + name + '（点「保存明细」落库）', 'ok');
-}
-
-async function rxSaveLines(id) {
-  const rx = RX_STATE.rx; if (!rx) return;
-  const isHerb = rx.prescription_type !== 'WEST';
-  try {
-    if (isHerb) {
-      if (!RX_STATE.herbs.length) { toast('还没有加入饮片', 'err'); return; }
-      await api('/api/prescription/save/herbs', { prescription_id: id, items: RX_STATE.herbs,
-        doses: parseInt(val('rx_doses')) || rx.doses || 7,
-        decoction_method: val('rx_decoction') || rx.decoction_method,
-        administration: val('rx_admin') || rx.administration });
-      RX_STATE.herbs = [];
-    } else {
-      if (!RX_STATE.drugs.length) { toast('还没有加入药品', 'err'); return; }
-      await api('/api/prescription/save/items', { prescription_id: id, items: RX_STATE.drugs });
-      RX_STATE.drugs = [];
-    }
-    toast('明细已保存', 'ok'); await rxOpen(id);
-  } catch (e) { toast(e.message, 'err'); }
+async function rxFreqAdd(id, dose) {
+  const isHerb = rxIsHerb();
+  const hit = (isHerb ? CAT.herbs : CAT.drugs).find(x => x.id === id);
+  if (!hit) { toast('品目不在目录中', 'err'); return; }
+  rxPush(hit, dose);
+  await rxCommit('已加入 ' + (isHerb ? hit.name : hit.generic_name) + ' ' + dose);
 }
 
 async function rxPrice(id) {
   try {
     const r = await api('/api/prescription/price', { prescription_id: id });
-    $('#rx_msg').innerHTML = '计价完成：' + JSON.stringify(r.pricing || r).slice(0, 160);
+    const el = document.getElementById('rx_msg');
+    if (el) el.innerHTML = '<span class="ok">计价完成</span> ' + esc(JSON.stringify(r.pricing || r).slice(0, 200));
+    await rxOpen(id);
   } catch (e) { toast(e.message, 'err'); }
 }
+
 async function rxCheck(id) {
   try {
     const r = await api('/api/prescription/validate', { prescription_id: id });
@@ -1232,56 +1578,64 @@ async function rxCheck(id) {
     else toast(r.passed ? '规则预检通过' : '存在阻断项，见提示', r.passed ? 'ok' : 'err');
   } catch (e) { toast(e.message, 'err'); }
 }
+
 async function rxSubmit(id) {
   try { await api('/api/prescription/submit', { prescription_id: id }); toast('已提交', 'ok'); await rxLoad(); await rxOpen(id); }
   catch (e) { toast(e.message, 'err'); }
 }
+
 async function rxConfirm(id) {
   const pwd = prompt('确认处方需要签名口令：');
   if (!pwd) return;
   try { await api('/api/prescription/confirm', { prescription_id: id, password: pwd }); toast('处方已确认', 'ok'); await rxLoad(); await rxOpen(id); }
   catch (e) { toast(e.message, 'err'); }
 }
+
 async function rxVoid(id) {
   const reason = prompt('作废原因（必填）：');
   if (!reason) return;
   try { await api('/api/prescription/void', { prescription_id: id, reason: reason }); toast('已作废', 'ok'); await rxLoad(); }
   catch (e) { toast(e.message, 'err'); }
 }
-/* 药品 / 饮片资料建档（F32 / F110）——没有目录就开不了方 */
+
+/* 药品 / 饮片目录建档（F32 / F110）——收进折叠区，日常开方不该被它挡住 */
 function rxCatalogForm() {
   return `
-  <div class="section-title">药品 / 饮片目录维护</div>
-  <div class="row">
+  <details style="margin-top:10px"><summary class="hint">药品 / 饮片目录维护（缺药时才用）</summary>
+  <div class="row" style="margin-top:6px">
     <select id="cat_kind" style="width:110px">
       <option value="drug">成药</option><option value="herb">饮片</option></select>
     <input id="cat_code" placeholder="编码" style="width:110px">
     <input id="cat_name" placeholder="名称" style="width:150px">
-    <input id="cat_price" placeholder="成药填单价(元)/饮片填每克(分)" style="width:180px">
+    <input id="cat_price" placeholder="单价：成药元/盒，饮片元/克" style="width:190px">
     <input id="cat_unit" placeholder="单位，如 盒" style="width:90px">
     <input id="cat_spec" placeholder="规格" style="width:120px">
     <button class="btn sm" onclick="rxCatCreate()">建档</button>
   </div>
-    <div class="hint">饮片价格单位是「分/克」：如 0.05 元/克 填 50。</div>
-    <div class="row">
-      <input id="cat_id" placeholder="品目 ID（改资料用）" style="width:130px">
-      <input id="cat_price2" placeholder="新单价(元)/新每克(分)" style="width:170px">
-      <button class="btn sm ghost" onclick="rxCatUpdate()">修改品目</button>
-    </div>`;
+  <div class="hint">价格都按「元」填：成药填一盒多少钱（如 13.5），饮片填一克多少钱（如 0.05）。</div>
+  <div class="row">
+    <input id="cat_id" placeholder="品目 ID（改资料用）" style="width:130px">
+    <input id="cat_price2" placeholder="新单价（元）" style="width:150px">
+    <button class="btn sm ghost" onclick="rxCatUpdate()">修改品目</button>
+  </div>
+  </details>`;
 }
+
 async function rxCatUpdate() {
   const id = parseInt(val('cat_id'));
   if (!id) { toast('填品目 ID', 'err'); return; }
   const price = parseFloat(val('cat_price2') || 0);
   try {
     if (val('cat_kind') === 'herb') {
-      await api('/api/herb/update', { id: id, price_milli_per_g: Math.round(price) });
+      await api('/api/herb/update', { id: id, price_yuan_per_g: price });
     } else {
       await api('/api/drug/update', { id: id, price_fen: Math.round(price * 100) });
     }
-    toast('品目已更新（改价不影响已开处方，开方时取的是开方时价）', 'ok');
+    toast('品目已更新（改价不影响已开处方）', 'ok');
+    await loadCatalog(true);
   } catch (e) { toast(e.message, 'err'); }
 }
+
 async function rxCatCreate() {
   const kind = val('cat_kind'), code = val('cat_code'), name = val('cat_name');
   if (!code || !name) { toast('编码与名称必填', 'err'); return; }
@@ -1289,7 +1643,7 @@ async function rxCatCreate() {
   try {
     if (kind === 'herb') {
       await api('/api/herb/create', { herb_code: code, name: name,
-        price_milli_per_g: Math.round(price), unit: val('cat_unit') || 'g',
+        price_yuan_per_g: price, unit: val('cat_unit') || 'g',
         spec: val('cat_spec') || null });
     } else {
       await api('/api/drug/create', { drug_code: code, generic_name: name,
@@ -1297,16 +1651,18 @@ async function rxCatCreate() {
         spec: val('cat_spec') || null });
     }
     toast('已建档：' + name, 'ok');
+    await loadCatalog(true);
   } catch (e) { toast(e.message, 'err'); }
 }
 
-/* 处方模板（F127） */
+/* ---------- 处方模板（F127） ---------- */
 async function rxSaveAsTpl(id) {
   const name = prompt('模板名称：');
   if (!name) return;
   try { await api('/api/prescription/template/save_from', { prescription_id: id, name: name }); toast('已存为模板', 'ok'); }
   catch (e) { toast(e.message, 'err'); }
 }
+
 async function rxTplApply(id) {
   try {
     const tpls = (await api('/api/prescription/templates', {}, 'GET')).items || [];
@@ -1316,30 +1672,13 @@ async function rxTplApply(id) {
       <button class="btn sm" onclick="rxDoApply(${id},${t.id})">套用</button></div>`).join(''));
   } catch (e) { toast(e.message, 'err'); }
 }
+
 async function rxDoApply(rxId, tplId) {
   try { await api('/api/prescription/template/apply', { prescription_id: rxId, template_id: tplId }); toast('已套用模板', 'ok'); closeModal(); await rxOpen(rxId); }
   catch (e) { toast(e.message, 'err'); }
 }
-async function rxTplCreate() {
-  const name = prompt('模板名称：'); if (!name) return;
-  const type = prompt('处方类型（WEST / HERB / GRANULE）：', 'HERB') || 'HERB';
-  modal('模板明细', `按「品目ID:剂量（饮片按克）」每行一条，例：1:15
-    <textarea id="tpl_lines" style="width:100%;height:140px;margin-top:8px"></textarea>
-    <div class="row" style="margin-top:8px"><button class="btn" onclick="rxDoTplCreate('${esc(name)}','${esc(type.toUpperCase())}')">保存模板</button></div>`);
-}
-async function rxDoTplCreate(name, type) {
-  const items = val('tpl_lines').split('\n').map(s => s.trim()).filter(Boolean).map(s => {
-    const [id, dose] = s.split(':');
-    return type === 'HERB' ? { herb_id: parseInt(id), dose_g: parseFloat(dose) }
-                           : { drug_id: parseInt(id), quantity: parseFloat(dose) };
-  });
-  if (!items.length) { toast('请至少写一行明细', 'err'); return; }
-  try { await api('/api/prescription/template/create', { name: name, prescription_type: type, items: items }); toast('模板已创建', 'ok'); closeModal(); }
-  catch (e) { toast(e.message, 'err'); }
-}
+
 async function rxGuide(id) {
-  // 注意：/api/prescription/guide 是**写入**接口（content 必填），不是读取接口。
-  // 必须先让医生录入指导内容，否则后端会拒（用药指导内容不能为空）。
   const content = prompt('录入用药指导内容（如：饭后服用，忌生冷，疗程 7 天）：');
   if (!content) return;
   try {
@@ -2200,10 +2539,16 @@ async function viewPharmacy() {
       <select id="rx_id" class="pick" onchange="phLoadRx()"><option value="">— 先选就诊 —</option></select>
     </div>
     <div class="row">
-      <button class="btn sm" onclick="phLoadRx()">读取处方</button>
-      <button class="btn sm ghost" onclick="phDispense('WEST')">成药发药</button>
-      <button class="btn sm ghost" onclick="phDispense('HERB')">中药发药（自煎）</button>
+      <button class="btn" onclick="phDispenseAuto()">发药</button>
       <label class="hint"><input type="checkbox" id="ph_daijian"> 代煎</label>
+      <span class="hint">按处方类型自动走成药 / 中药调剂，不用先判断再选按钮</span>
+      <details style="margin-left:8px"><summary class="hint">手动指定</summary>
+        <div class="row" style="margin-top:6px">
+          <button class="btn sm ghost" onclick="phLoadRx()">读取处方</button>
+          <button class="btn sm ghost" onclick="phDispense('WEST')">成药发药</button>
+          <button class="btn sm ghost" onclick="phDispense('HERB')">中药发药</button>
+        </div>
+      </details>
     </div>
     <div id="rx_info" class="hint">先选就诊 → 选处方 → 读取，再执行发药或退药</div>
     <div class="row" style="margin-top:6px">
@@ -2416,7 +2761,7 @@ async function phVisitChanged() {
   P3.rxId = 0;
   await fillRxSelect('rx_id', vid);
   const sel = document.getElementById('rx_id');
-  if (sel && sel.value) { phLoadRx(); }
+  if (sel && sel.value) { await phLoadRx(); }   // 处方带出来后直接读，不用再点「读取处方」
   else if (vid) { document.getElementById('rx_info').innerHTML = '该就诊还没有处方，请医生先开方'; }
 }
 
@@ -2426,11 +2771,17 @@ async function phLoadRx() {
     if (!id) { toast('请先选择处方', 'err'); return; }
     const r = await api('/api/prescription/get', { id: id }, 'GET');
     P3.rxId = r.id;
+    P3.rxType = r.prescription_type || 'WEST';
     $('#rx_info').innerHTML = `<div>处方 ${esc(r.prescription_no)} · 类型 ${esc(r.prescription_type)}
       · 状态 ${esc(r.status)} · 金额 ${esc(yuan(r.total_amount))} 元
       · 付数 ${esc(r.doses || '-')}</div>
       <div class="hint">成药明细 ${esc((r.items || []).length)} 行 / 饮片明细 ${esc((r.herbs || []).length)} 行</div>`;
   } catch (e) { toast(e.message, 'err'); }
+}
+
+async function phDispenseAuto() {
+  if (!P3.rxId) { toast('请先选择就诊，系统会自动带出处方', 'err'); return; }
+  return phDispense(P3.rxType === 'WEST' ? 'WEST' : 'HERB');
 }
 
 async function phDispense(kind) {
@@ -2740,17 +3091,27 @@ async function viewBilling() {
       <button class="btn sm ghost" onclick="blLoad()">查询账单</button>
     </div>
     <div id="bl_info" class="hint">选择就诊后可生成账单，再在此查看明细、收费、退款与冲正</div>
+    <div id="bl_due" style="margin-top:6px"></div>
   </div>
 
   <div class="card">
     <h3>收费 / 退款 / 冲正（F59/F61/F62）</h3>
     <div class="row">
+      <button class="btn" onclick="blPayFast('CASH')">现金收讫</button>
+      <button class="btn ghost" onclick="blPayFast('WECHAT')">微信收讫</button>
+      <button class="btn ghost" onclick="blPayFast('ALIPAY')">支付宝收讫</button>
+      <button class="btn ghost" onclick="blPayFast('CARD')">银行卡收讫</button>
+      <span class="hint">点一下就按应收金额收齐，不用手打金额（现金会问实收、自动算找零）</span>
+    </div>
+    <details><summary class="hint">手工填金额收费（拆多笔时用）</summary>
+    <div class="row" style="margin-top:6px">
       <select id="pay_channel"><option value="CASH">现金</option><option value="WECHAT">微信</option>
         <option value="ALIPAY">支付宝</option><option value="CARD">银行卡</option></select>
       <input id="pay_amount" placeholder="金额（元）" style="width:120px">
       <button class="btn sm" onclick="blPay()">收费</button>
       <span class="hint">无部分支付：多笔合计必须等于应收</span>
     </div>
+    </details>
     <div class="hint">日常退款 / 冲正：直接在上方账单明细对应行点「退款」或「冲正」。</div>
     <details style="margin-top:6px"><summary class="hint">高级：按明细行操作（需知道行 ID）</summary>
     <div class="row">
@@ -2935,6 +3296,51 @@ async function blLoad() {
       || '<tr><td class="empty" colspan="5">无明细</td></tr>'}</tbody></table>
       <div class="hint">支付 ${esc((b.payments || []).length)} 笔 / 退款 ${esc((b.refunds || []).length)} 笔
         ${b.settlement_id ? ' · 已日结（锁定）' : ''}</div>`;
+    // 待收金额自动带出来：手工收费时不用再照着屏幕上方的数字敲一遍
+    const el = document.getElementById('pay_amount');
+    if (el) {
+      const paid = (b.payments || []).filter(p => p.status === 'SUCCESS')
+        .reduce((s, p) => s + p.amount_fen, 0);
+      const rest = (b.total_amount_fen || 0) - paid;
+      el.value = rest > 0 ? (rest / 100).toFixed(2) : '';
+    }
+    const box = document.getElementById('bl_due');
+    if (box) {
+      const paid = (b.payments || []).filter(p => p.status === 'SUCCESS')
+        .reduce((s, p) => s + p.amount_fen, 0);
+      const rest = (b.total_amount_fen || 0) - paid;
+      box.innerHTML = rest > 0
+        ? `<span class="tag warn">待收 ${esc(yuan(rest))} 元</span> 点上面「现金/微信/支付宝收讫」直接收齐`
+        : '<span class="tag ok">已收讫</span>';
+    }
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+/* 一键收讫：按应收金额收齐，不用手打金额。
+   现金场景问一句实收，后端自动算找零（change_amount_fen）。 */
+async function blPayFast(channel) {
+  if (!P3.billId) { toast('请先生成或选择账单', 'err'); return; }
+  try {
+    const b = await api('/api/bill/get', { id: P3.billId }, 'GET');
+    const paid = (b.payments || []).filter(p => p.status === 'SUCCESS')
+      .reduce((s, p) => s + p.amount_fen, 0);
+    const rest = b.total_amount_fen - paid;
+    if (rest <= 0) { toast('这张账单已经收讫了', 'ok'); return; }
+    let received = rest;
+    if (channel === 'CASH') {
+      const got = prompt('实收现金（元）：', (rest / 100).toFixed(2));
+      if (got === null) return;
+      received = Math.round(parseFloat(got) * 100);
+      if (!received || received < rest) { toast('实收不能少于应收 ' + (rest / 100).toFixed(2) + ' 元', 'err'); return; }
+    }
+    const r = await api('/api/bill/pay', {
+      bill_id: Number(P3.billId),
+      payments: [{ channel: channel, amount_fen: rest, received_amount_fen: received }],
+    });
+    const change = received - rest;
+    toast('收费成功：' + yuan(r.paid_amount_fen) + ' 元' +
+      (change > 0 ? '，找零 ' + yuan(change) + ' 元' : ''), 'ok');
+    await blLoad();
   } catch (e) { toast(e.message, 'err'); }
 }
 

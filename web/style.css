@@ -111,3 +111,15 @@ label.chk {
 }
 label.chk input[type=checkbox] { width: auto; margin: 0; }
 .picker-hint { color: var(--muted); font-size: 12px; }
+
+/* 开方连续录入：输入即出候选，↑↓ 选、回车确认 */
+.cand-box {
+  position: absolute; left: 0; right: 90px; top: 100%; z-index: 30;
+  background: #fff; border: 1px solid var(--line); border-radius: 4px;
+  max-height: 260px; overflow: auto; box-shadow: 0 4px 14px rgba(15,23,42,.14);
+}
+.cand { padding: 6px 10px; cursor: pointer; display: flex; justify-content: space-between; gap: 10px; }
+.cand:hover { background: #f0f4fa; }
+.cand.on { background: var(--primary); color: #fff; }
+.cand.on .hint { color: #e8f0fb; }
+input.dose { width: 74px; display: inline-block; }
