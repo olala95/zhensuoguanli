@@ -169,14 +169,24 @@ def _verify_backup(path):
 
 
 def cleanup():
-    """保留策略：全量 keep_days 天 + 每日最近 7 份 + 每月 1 份长期归档。
+    """保留策略（F91 R4）：
+
+    · 最近 3 份无条件保留
+    · 7 天内每个自然日最多 2 份
+    · retention 天内每个自然日最多 1 份
+    · 更早的每月保留 1 份
+    · 目录总量超过 backup.max_total_mb 时，从最旧的继续删（仍保住最近 3 份）
 
     **增量随所属全量级联删除**（F91 R4）：不允许出现"全量已删但增量还在"的孤儿链。
+
+    按自然日去重是关键：一个下午连续做 16 次备份不该留下 16 份同日快照，
+    否则备份目录会把磁盘吃光，而磁盘一满备份就失败、系统随即进只读。
     """
     if not db.table_exists("backup_job"):
         return 0
     retention = (config.get_int("backup.keep_days", 0)
                  or config.get_int("backup.retention_days", 30))
+    max_total_mb = config.get_int("backup.max_total_mb", 2048)
     d = _dir()
     jobs = db.query("""SELECT id, job_no, job_type, parent_job_no, file_path
                        FROM backup_job
@@ -186,8 +196,9 @@ def cleanup():
     for r in jobs:
         path_of[os.path.basename(r["file_path"])] = r
     ordered = sorted(path_of.items(), key=lambda kv: kv[0], reverse=True)  # 文件名含时间戳，新→旧
-    cutoff = time.time() - retention * 86400
-    keep_monthly = {}
+    now = time.time()
+    cutoff = now - retention * 86400
+    keep_monthly, day_kept = {}, {}
     drop = set()
     for i, (fn, job) in enumerate(ordered):
         p = os.path.join(d, fn)
@@ -195,11 +206,42 @@ def cleanup():
             mtime = os.path.getmtime(p)
         except OSError:
             continue
-        ym = fn[7:13]  # clinic_YYYYMM...
+        ym, day = fn[7:13], fn[7:15]     # clinic_YYYYMMDD_HHMMSS
         keep_monthly.setdefault(ym, job["job_no"])
-        if i < 7 or mtime > cutoff or keep_monthly.get(ym) == job["job_no"]:
-            continue
-        drop.add(job["job_no"])
+        if i < 3:
+            keep = True
+        elif now - mtime <= 7 * 86400:
+            keep = day_kept.get(day, 0) < 2
+        elif mtime > cutoff:
+            keep = day_kept.get(day, 0) < 1
+        else:
+            keep = keep_monthly.get(ym) == job["job_no"]
+        if keep:
+            day_kept[day] = day_kept.get(day, 0) + 1
+        else:
+            drop.add(job["job_no"])
+
+    # 总量守卫：备份撑满磁盘 → 下次备份失败 → 系统进只读，代价远大于删几个旧快照
+    if max_total_mb and max_total_mb > 0:
+        alive = [(fn, job) for fn, job in ordered if job["job_no"] not in drop]
+        sizes, total = {}, 0
+        for fn, _job in alive:
+            try:
+                sz = os.path.getsize(os.path.join(d, fn))
+            except OSError:
+                sz = 0
+            sizes[fn] = sz
+            total += sz
+        limit = max_total_mb * 1024 * 1024
+        if total > limit:
+            before = total
+            for fn, job in reversed(alive[3:]):
+                if total <= limit:
+                    break
+                drop.add(job["job_no"])
+                total -= sizes.get(fn, 0)
+            log.warning("备份目录 %d MB 超上限 %d MB，回收至 %d MB",
+                        int(before / 1048576), max_total_mb, int(total / 1048576))
 
     all_no = {j["job_no"] for j in jobs}
     for fn, job in ordered:

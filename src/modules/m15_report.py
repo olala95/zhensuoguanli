@@ -172,14 +172,21 @@ def visit_stats(ctx, body, q):
         raise AppError(DATA_FORMAT, "granularity 取值应为 day/month", retryable=False,
                        http_status=400)
     expr = "biz_date" if gran == "day" else "substr(biz_date,1,7)"
+    # 诊疗类型筛选：TCM 只看中医，WEST 看西医（含历史 NORMAL 数据），空=全部
+    vtype = (q.get("visit_type") or "").strip().upper()
+    vfilter, vparams = "", []
+    if vtype == "TCM":
+        vfilter = " AND visit_type='TCM'"
+    elif vtype == "WEST":
+        vfilter = " AND visit_type IN ('WEST','NORMAL')"
     rows = db.query("""
         SELECT {g} AS period, COUNT(*) AS total,
                SUM(CASE WHEN prior_completed = 0 THEN 1 ELSE 0 END) AS first_visit,
                SUM(CASE WHEN prior_completed > 0 THEN 1 ELSE 0 END) AS revisit
         FROM v_visit_stats
-        WHERE status='COMPLETED' AND biz_date >= ? AND biz_date <= ?
+        WHERE status='COMPLETED' AND biz_date >= ? AND biz_date <= ?{f}
         GROUP BY {g} ORDER BY {g}
-    """.format(g=expr), (d_from, d_to))
+    """.format(g=expr, f=vfilter), tuple([d_from, d_to] + vparams))
     by_type = db.query("""
         SELECT visit_type, COUNT(*) AS c FROM v_visit_stats
         WHERE status='COMPLETED' AND biz_date >= ? AND biz_date <= ?
@@ -188,7 +195,8 @@ def visit_stats(ctx, body, q):
     total = sum(int(r["total"] or 0) for r in rows)
     first = sum(int(r["first_visit"] or 0) for r in rows)
     return {
-        "criteria": _criteria("visit", d_from, d_to, {"granularity": gran}),
+        "criteria": _criteria("visit", d_from, d_to,
+                              {"granularity": gran, "visit_type": vtype or "ALL"}),
         "summary": {"visit_count": total, "first_visit": first,
                     "revisit": total - first,
                     "revisit_rate": _pct(total - first, total)},

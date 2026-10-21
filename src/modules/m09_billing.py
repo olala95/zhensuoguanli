@@ -204,12 +204,12 @@ def bill_create(ctx, body, q):
         bid = cur.lastrowid
 
         lines = []
-        # ① 处方（成药 / 饮片）——金额取 F112 计价结果
+        # ① 处方（饮片 / 颗粒归中药，其余归西药成药）——金额取 F112 计价结果
         for rx in m06.prescribed_amount_for_bill(visit_id):
-            stype = "HERB" if rx["prescription_type"] == "HERB" else "DRUG"
+            is_herb = rx["prescription_type"] in ("HERB", "GRANULE")
+            stype = "HERB" if is_herb else "DRUG"
             lines.append((stype, rx["id"],
-                          "%s处方 %s" % ("中药" if stype == "HERB" else "",
-                                         rx["prescription_no"]),
+                          "%s处方 %s" % ("中药" if is_herb else "", rx["prescription_no"]),
                           int(rx["amount_fen"])))
         # ② 处置（M08，只读快照）
         for t in db.query("SELECT * FROM treatment_execution WHERE visit_id=? AND deleted_at "

@@ -1875,7 +1875,9 @@ async function viewLab() {
     <div class="hint" style="margin-top:6px">
       已登记机构 ${agencies.length} 家 / 外送项目 ${items.length} 项。
       流程：开单 → 采样 → 送检 → 回报 → 录入结果 → 医生阅片。
+      <span class="hint">检验项目本身通用，不按中西医区分。</span>
     </div>
+    <div id="lb_mode" style="margin-top:4px"></div>
     <div id="lb_body"><div class="hint">先在上方选择本次就诊，再点「载入」。</div></div>
   </div>`;
 }
@@ -1883,6 +1885,11 @@ async function viewLab() {
 async function lbLoad() {
   LB.visitId = parseInt(val('lb_visit')) || 0;
   if (!LB.visitId) { toast('请先选择就诊', 'err'); return; }
+  // 顶部标明本次就诊走的是中医还是西医，避免在错的流程里点点点
+  api('/api/visit/get', { id: LB.visitId }, 'GET').then(v => {
+    const el = document.getElementById('lb_mode');
+    if (el) el.innerHTML = '<span class="hint">本次就诊：</span>' + MODE.chip(v);
+  }).catch(() => { });
   try {
     const list = (await api('/api/lab/order/list', { visit_id: LB.visitId }, 'GET')).items || [];
     const catItems = (await api('/api/lab/item/search', { keyword: '' }, 'GET')).items || [];
@@ -3150,9 +3157,42 @@ async function trSkinList() {
 
 async function trSearch() {
   try {
+    // 处置项目表本身带 is_tcm：中医就诊优先只看中医操作（针灸推拿等），
+    // 西医就诊只看非中医操作；本类目没有项目时退回显示全部，不给死局
+    const vid = val('tr_visit') || P3.visitId;
+    let isTcm = MODE.def === 'TCM';
+    if (vid) {
+      try {
+        const v = await api('/api/visit/get', { id: vid }, 'GET');
+        isTcm = MODE.isTcm(v);
+      } catch (e) { /* 取不到就按当前模式 */ }
+    }
     const d = await api('/api/treatment/item/search', { keyword: val('tr_kw') }, 'GET');
-    $('#tr_result').innerHTML = `<table><thead><tr><th>项目</th><th>类别</th><th>单价</th><th></th></tr></thead><tbody>${
-      (d.items || []).map(x => `<tr><td>${esc(x.name)}</td><td>${esc(x.category)}</td><td>${esc(yuan(x.price_fen))}</td>
+    let list = d.items || [];
+    const matched = list.filter(x => (Number(x.is_tcm) === 1) === isTcm);
+    const filtered = matched.length > 0;
+    if (filtered) list = matched;
+    const note = filtered
+      ? `<div class="hint">已按${isTcm ? '中医' : '西医'}就诊过滤：只显示${isTcm ? '中医操作（针灸/推拿等）' : '西医操作'}。
+         <a href="javascript:void(0)" onclick="trShowAll()">看全部项目</a></div>`
+      : `<div class="hint">本类目暂无项目，已显示全部（共 ${list.length} 项）。</div>`;
+    $('#tr_result').innerHTML = note
+      + `<table><thead><tr><th>项目</th><th>类别</th><th>单价</th><th></th></tr></thead><tbody>${
+        list.map(x => `<tr><td>${esc(x.name)}${Number(x.is_tcm) === 1 ? ' <span class="tag tcm">中医</span>' : ''}</td>
+          <td>${esc(x.category)}</td><td>${esc(yuan(x.price_fen))}</td>
+          <td><button class="btn sm" onclick="trOrder(${x.id})">开立 ×1</button></td></tr>`).join('')
+        || '<tr><td class="empty" colspan="4">无匹配项目</td></tr>'}</tbody></table>`;
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+async function trShowAll() {
+  TR_ALL = true;
+  try {
+    const d = await api('/api/treatment/item/search', { keyword: val('tr_kw') }, 'GET');
+    $('#tr_result').innerHTML = `<div class="hint">已显示全部项目</div>
+      <table><thead><tr><th>项目</th><th>类别</th><th>单价</th><th></th></tr></thead><tbody>${
+      (d.items || []).map(x => `<tr><td>${esc(x.name)}${Number(x.is_tcm) === 1 ? ' <span class="tag tcm">中医</span>' : ''}</td>
+        <td>${esc(x.category)}</td><td>${esc(yuan(x.price_fen))}</td>
         <td><button class="btn sm" onclick="trOrder(${x.id})">开立 ×1</button></td></tr>`).join('')
       || '<tr><td class="empty" colspan="4">无匹配项目</td></tr>'}</tbody></table>`;
   } catch (e) { toast(e.message, 'err'); }
@@ -3454,12 +3494,37 @@ async function blLoad() {
   P3.billId = id;
   try {
     const b = await api('/api/bill/get', { id: id }, 'GET');
+    // 账单行的 source_type 直接标明来源：HERB 中药 / DRUG 西药成药 /
+    // TREATMENT 处置 / LAB 检验 / CHARGE 收费项目，不必再反查处方
+    const srcTag = (i) => {
+      switch (i.source_type) {
+        case 'HERB': return '<span class="tag tcm">中药</span>';
+        case 'DRUG': return '<span class="tag west">西药/成药</span>';
+        case 'TREATMENT': return '<span class="tag muted">处置</span>';
+        case 'LAB': return '<span class="tag muted">检验</span>';
+        case 'CHARGE': return '<span class="tag muted">收费项目</span>';
+        default: return esc(i.source_type || '');
+      }
+    };
+    // 中药费 / 西药费 / 其它 分开小计，账目一眼可辨
+    let herbFee = 0, westFee = 0, otherFee = 0;
+    (b.items || []).forEach(i => {
+      const amt = Number(i.amount_fen) || 0;
+      if (i.source_type === 'HERB') herbFee += amt;
+      else if (i.source_type === 'DRUG') westFee += amt;
+      else otherFee += amt;
+    });
     $('#bl_info').innerHTML = `<div>账单 ${esc(b.bill_no)} · 状态 ${esc(b.status)}
       · 应收 ${esc(yuan(b.total_amount_fen))} 元 · 已收 ${esc(yuan(b.paid_amount_fen))} 元
       · 已退 ${esc(yuan(b.refunded_amount_fen))} 元</div>
-      <table><thead><tr><th>行</th><th>项目</th><th>来源</th><th>金额</th><th>操作</th></tr></thead><tbody>${
+      <div class="row" style="margin-top:4px">
+        <span class="tag tcm">中药费 ${esc(yuan(herbFee))} 元</span>
+        <span class="tag west">西药/成药 ${esc(yuan(westFee))} 元</span>
+        <span class="tag muted">其它 ${esc(yuan(otherFee))} 元</span>
+      </div>
+      <table><thead><tr><th>行</th><th>项目</th><th>归类</th><th>金额</th><th>操作</th></tr></thead><tbody>${
       (b.items || []).map(i => `<tr><td>${esc(i.line_no)}</td><td>${esc(i.name_snap)}</td>
-        <td>${esc(i.source_type)}#${esc(i.source_id)}</td><td>${esc(yuan(i.amount_fen))}</td>
+        <td>${srcTag(i)}</td><td>${esc(yuan(i.amount_fen))}</td>
         <td><button class="btn sm ghost" onclick="blItemRefund(${i.id}, this)">退款</button>
             <button class="btn sm ghost" onclick="blItemReversal(${i.id}, this)">冲正</button></td></tr>`).join('')
       || '<tr><td class="empty" colspan="5">无明细</td></tr>'}</tbody></table>
@@ -3655,6 +3720,11 @@ function viewReport() {
       </select>
       <input id="rp_from" type="date" style="width:150px">
       <input id="rp_to" type="date" style="width:150px">
+      <select id="rp_type" style="width:120px" onchange="rpTypeChanged()">
+        <option value="">全部诊疗</option>
+        <option value="TCM">只看中医</option>
+        <option value="WEST">只看西医</option>
+      </select>
       <button class="btn sm" onclick="rpLoad()">查询</button>
       <button class="btn sm ghost" onclick="rpExport()">导出 CSV</button>
       <button class="btn sm ghost" onclick="rpPrint()">打印预览</button>
@@ -3680,7 +3750,23 @@ function rpRange() {
   const b = {};
   if (val('rp_from')) b.from = val('rp_from');
   if (val('rp_to')) b.to = val('rp_to');
+  const t = val('rp_type');
+  if (t) b.visit_type = t;
   return b;
+}
+
+/* 诊疗类型筛选目前只对「门诊量」生效（其它报表无 visit_type 维度），
+   切换时说清楚，避免以为全都过滤了 */
+function rpTypeChanged() {
+  const t = val('rp_type');
+  if (!t) return;
+  if (RPT.kind !== 'visit') {
+    toast('诊疗类型筛选只对「门诊量」生效，已为你切过去', 'ok');
+    RPT.kind = 'visit';
+    const sel = document.getElementById('rp_kind');
+    if (sel) sel.value = 'visit';
+    rpLoad();
+  }
 }
 
 async function rpLoad() {
@@ -3693,7 +3779,9 @@ async function rpLoad() {
   try {
     const d = await api(paths[kind], rpRange(), 'GET');
     RPT.data = d;
-    $('#rp_body').innerHTML = `<div class="hint">口径：${esc(d.criteria.basis)}　区间 ${esc(d.criteria.from)} ~ ${esc(d.criteria.to)}</div>`
+    const vt = (d.criteria && d.criteria.visit_type) || 'ALL';
+    const vtLabel = vt === 'TCM' ? '　<b>仅中医</b>' : (vt === 'WEST' ? '　<b>仅西医</b>' : '');
+    $('#rp_body').innerHTML = `<div class="hint">口径：${esc(d.criteria.basis)}　区间 ${esc(d.criteria.from)} ~ ${esc(d.criteria.to)}${vtLabel}</div>`
       + rpRender(kind, d);
   } catch (e) { toast(e.message, 'err'); }
 }
