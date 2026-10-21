@@ -1853,15 +1853,35 @@ async function rxPrint(id) {
 /* ============================================================
    M05 检验检查（F27-F31 / F117-F118）全部外送
    ============================================================ */
-const LB = { visitId: 0, orderId: 0, kw: '' };
+const LB = { visitId: 0, orderId: 0, kw: '', items: [], agencies: [] };
 
 async function viewLab() {
   let agencies = [], items = [];
   try {
     agencies = (await api('/api/lab/agency/list', {}, 'GET')).items || [];
-    items = (await api('/api/lab/item/search', { keyword: '' }, 'GET')).items || [];
   } catch (e) { /* 权限不足时降级为只读提示 */ }
+  try {
+    items = (await api('/api/lab/item/list', {}, 'GET')).items || [];
+  } catch (e) {
+    try { items = (await api('/api/lab/item/search', { keyword: '' }, 'GET')).items || []; }
+    catch (e2) { }
+  }
   try { await loadVisitChoices(); } catch (e) { }
+  LB.items = items;
+  LB.agencies = agencies;
+  const SPEC_OPTS = ['血', '尿', '便', '痰', '分泌物', '组织', '其他'];
+  const CAT_OPTS = ['检验', '病理', '影像', '功能'];
+  const itemRows = items.map(x => `<tr>
+    <td>${esc(x.name)}${x.short_name ? ' <span class="hint">' + esc(x.short_name) + '</span>' : ''}</td>
+    <td>${esc(x.item_code)}</td>
+    <td>${esc(x.category || '')}</td>
+    <td>${esc(x.specimen_type || '')}</td>
+    <td>${esc(yuan(x.price_fen))}</td>
+    <td class="hint">${esc(yuan(x.settle_price_fen))}</td>
+    <td>${x.report_days != null ? esc(x.report_days) + ' 天' : '-'}</td>
+    <td>${x.is_active ? '<span class="tag ok">启用</span>' : '<span class="tag muted">停用</span>'}</td>
+    <td><button class="btn sm ghost" onclick="lbItemEdit(${x.id})">修改</button></td>
+  </tr>`).join('');
   return `
   <div class="card">
     <h3>检验检查（全部外送）</h3>
@@ -1869,8 +1889,6 @@ async function viewLab() {
       ${visitSelectHtml('lb_visit', { selected: LB.visitId, onchange: 'lbLoad()' })}
       <button class="btn sm" onclick="lbLoad()">载入该就诊检验单</button>
       <span class="spacer"></span>
-      <button class="btn ghost sm" onclick="lbNewAgency()">新增机构</button>
-      <button class="btn ghost sm" onclick="lbNewItem()">新增项目</button>
       <button class="btn ghost sm" onclick="lbRecList()">机构对账（F118）</button>
       <button class="btn ghost sm" onclick="lbReconcile()">生成对账单</button>
     </div>
@@ -1881,6 +1899,51 @@ async function viewLab() {
     </div>
     <div id="lb_mode" style="margin-top:4px"></div>
     <div id="lb_body"><div class="hint">先在上方选择本次就诊，再点「载入」。</div></div>
+  </div>
+
+  <div class="card">
+    <h3>检验项目目录（F27）· 共 ${items.length} 项</h3>
+    <details style="margin-bottom:8px">
+      <summary class="hint">＋ 新增检验项目（点开填写，一次填完再提交）</summary>
+      <div class="row" style="margin-top:8px">
+        <input id="li_code" placeholder="项目编码，如 CRP" style="width:160px">
+        <input id="li_name" placeholder="项目名称，如 C反应蛋白" style="width:220px">
+        <select id="li_cat" style="width:110px">${CAT_OPTS.map(c => `<option>${c}</option>`).join('')}</select>
+        <select id="li_spec" style="width:110px">${SPEC_OPTS.map(c => `<option>${c}</option>`).join('')}</select>
+        <input id="li_short" placeholder="简称（可选）" style="width:130px">
+      </div>
+      <div class="row" style="margin-top:6px">
+        <input id="li_price" placeholder="向患者收费 元" style="width:150px">
+        <input id="li_settle" placeholder="与机构结算 元" style="width:150px">
+        <input id="li_days" placeholder="出报告天数" style="width:130px">
+        <input id="li_remark" placeholder="备注（可选）" style="flex:1">
+        <button class="btn sm" onclick="lbItemCreate2()">添加项目</button>
+      </div>
+      <div class="hint">收费价是向患者收的，结算价是付给检验机构的成本，两者可以不同；差价就是这块的收入。</div>
+    </details>
+    <table class="tbl">
+      <thead><tr><th>项目</th><th>编码</th><th>类别</th><th>标本</th><th>收费(元)</th>
+        <th>结算(元)</th><th>报告</th><th>状态</th><th>操作</th></tr></thead>
+      <tbody>${itemRows || '<tr><td colspan="9" class="hint">还没有检验项目，点上面「新增检验项目」添加</td></tr>'}</tbody>
+    </table>
+
+    <h3 style="margin-top:14px">外送机构 · 共 ${agencies.length} 家</h3>
+    <div class="row">
+      <input id="la_code" placeholder="机构编码" style="width:150px">
+      <input id="la_name" placeholder="机构名称" style="width:220px">
+      <input id="la_contact" placeholder="联系人" style="width:130px">
+      <input id="la_phone" placeholder="电话" style="width:150px">
+      <button class="btn sm ghost" onclick="lbAgencyCreate2()">新增机构</button>
+    </div>
+    <table class="tbl" style="margin-top:6px">
+      <thead><tr><th>机构</th><th>编码</th><th>联系人</th><th>电话</th><th>状态</th><th>操作</th></tr></thead>
+      <tbody>${agencies.map(a => `<tr>
+        <td>${esc(a.name)}</td><td>${esc(a.agency_code)}</td>
+        <td>${esc(a.contact || '')}</td><td>${esc(a.phone || '')}</td>
+        <td>${a.is_active ? '<span class="tag ok">启用</span>' : '<span class="tag muted">停用</span>'}</td>
+        <td><button class="btn sm ghost" onclick="lbAgencyEdit(${a.id})">修改</button></td>
+      </tr>`).join('') || '<tr><td colspan="6" class="hint">还没有外送机构</td></tr>'}</tbody>
+    </table>
   </div>`;
 }
 
@@ -2038,6 +2101,125 @@ async function lbNewItem() {
       settle_price_fen: Math.round(parseFloat(settle || 0) * 100),
       report_days: parseInt(days) || 1, specimen_type: 'BLOOD' });
     toast('已新增项目', 'ok'); render();
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+/* ---------- 检验项目 / 机构维护（F27）：列表 + 表单，不再连环弹 prompt ---------- */
+async function lbItemCreate2() {
+  const code = (val('li_code') || '').trim();
+  const name = (val('li_name') || '').trim();
+  if (!code || !name) { toast('项目编码与名称为必填', 'err'); return; }
+  try {
+    await api('/api/lab/item/create', {
+      item_code: code, name: name,
+      short_name: (val('li_short') || '').trim() || null,
+      category: val('li_cat'), specimen_type: val('li_spec'),
+      price_fen: Math.round(parseFloat(val('li_price') || 0) * 100),
+      settle_price_fen: Math.round(parseFloat(val('li_settle') || 0) * 100),
+      report_days: parseInt(val('li_days'), 10) || null,
+      remark: (val('li_remark') || '').trim() || null,
+    });
+    toast('已添加检验项目：' + name, 'ok');
+    render();
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+function lbItemEdit(id) {
+  const it = (LB.items || []).find(x => x.id === id);
+  if (!it) { toast('项目不存在，请刷新', 'err'); return; }
+  modal('修改检验项目 · ' + it.name, `
+    <div class="grid3">
+      <div><label>名称</label><input id="ei_name" value="${esc(it.name)}"></div>
+      <div><label>类别</label><input id="ei_cat" value="${esc(it.category || '')}"></div>
+      <div><label>标本类型</label><input id="ei_spec" value="${esc(it.specimen_type || '')}"></div>
+      <div><label>向患者收费（元）</label><input id="ei_price" value="${((it.price_fen || 0) / 100).toFixed(2)}"></div>
+      <div><label>与机构结算（元）</label><input id="ei_settle" value="${((it.settle_price_fen || 0) / 100).toFixed(2)}"></div>
+      <div><label>出报告天数</label><input id="ei_days" value="${it.report_days != null ? it.report_days : ''}"></div>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <button class="btn" onclick="lbItemSave(${id})">保存</button>
+      <button class="btn ${it.is_active ? 'warn' : 'ghost'}"
+        onclick="lbItemToggle(${id},${it.is_active ? 0 : 1})">${it.is_active ? '停用此项目' : '重新启用'}</button>
+    </div>
+    <div class="hint">改价只影响此后新开的检验单；已开单按下单时的价格计费，不会追溯改账。</div>`);
+}
+
+async function lbItemSave(id) {
+  try {
+    await api('/api/lab/item/update', {
+      id: id,
+      name: (val('ei_name') || '').trim() || null,
+      category: val('ei_cat'), specimen_type: val('ei_spec'),
+      price_yuan: parseFloat(val('ei_price') || 0),
+      settle_price_yuan: parseFloat(val('ei_settle') || 0),
+      report_days: parseInt(val('ei_days'), 10) || null,
+    });
+    toast('已保存', 'ok');
+    closeModal();
+    render();
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+async function lbItemToggle(id, active) {
+  try {
+    await api('/api/lab/item/update', { id: id, is_active: active });
+    toast(active ? '已重新启用' : '已停用（历史检验单不受影响）', 'ok');
+    closeModal();
+    render();
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+async function lbAgencyCreate2() {
+  const code = (val('la_code') || '').trim();
+  const name = (val('la_name') || '').trim();
+  if (!code || !name) { toast('机构编码与名称为必填', 'err'); return; }
+  try {
+    await api('/api/lab/agency/create', {
+      agency_code: code, name: name,
+      contact: (val('la_contact') || '').trim() || null,
+      phone: (val('la_phone') || '').trim() || null,
+    });
+    toast('已新增机构：' + name, 'ok');
+    render();
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+function lbAgencyEdit(id) {
+  const a = (LB.agencies || []).find(x => x.id === id);
+  if (!a) { toast('机构不存在，请刷新', 'err'); return; }
+  modal('修改外送机构 · ' + a.name, `
+    <div class="grid3">
+      <div><label>名称</label><input id="ea_name" value="${esc(a.name)}"></div>
+      <div><label>联系人</label><input id="ea_contact" value="${esc(a.contact || '')}"></div>
+      <div><label>电话</label><input id="ea_phone" value="${esc(a.phone || '')}"></div>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <button class="btn" onclick="lbAgencySave(${id})">保存</button>
+      <button class="btn ${a.is_active ? 'warn' : 'ghost'}"
+        onclick="lbAgencyToggle(${id},${a.is_active ? 0 : 1})">${a.is_active ? '停用此机构' : '重新启用'}</button>
+    </div>`);
+}
+
+async function lbAgencySave(id) {
+  try {
+    await api('/api/lab/agency/update', {
+      id: id,
+      name: (val('ea_name') || '').trim() || null,
+      contact: val('ea_contact'),
+      phone: val('ea_phone'),
+    });
+    toast('已保存', 'ok');
+    closeModal();
+    render();
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+async function lbAgencyToggle(id, active) {
+  try {
+    await api('/api/lab/agency/update', { id: id, is_active: active });
+    toast(active ? '已启用' : '已停用', 'ok');
+    closeModal();
+    render();
   } catch (e) { toast(e.message, 'err'); }
 }
 

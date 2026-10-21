@@ -132,6 +132,83 @@ def item_search(ctx, body, q):
     return {"items": db.query(sql, tuple(params))}
 
 
+@route("/api/lab/item/list", "GET", perm="lab.view", module="M05", action="lab.item.list")
+def item_list(ctx, body, q):
+    """维护用清单：默认含停用项，避免"停用了就再也找不回来"。"""
+    sql = "SELECT * FROM lab_item WHERE deleted_at IS NULL"
+    if not (q.get("include_inactive") in ("1", "true", "yes")):
+        sql += " AND is_active=1"
+    sql += " ORDER BY is_active DESC, category, name LIMIT 500"
+    return {"items": db.query(sql)}
+
+
+@route("/api/lab/item/update", "POST", perm="lab.agency.manage", module="M05",
+       action="lab.item.update")
+def item_update(ctx, body, q):
+    """改检验项目：收费价 / 结算价 / 报告周期 / 类别 / 标本 / 启停用。
+
+    价格改动只影响此后新开的检验单，已开单按开单时快照计费。
+    """
+    iid = body.get("id")
+    require(iid, "缺少 id")
+    with db.tx() as conn:
+        row = db.query_one("SELECT * FROM lab_item WHERE id=? AND deleted_at IS NULL", (iid,))
+        if row is None:
+            raise not_found("检验项目不存在")
+        fields = {}
+        if body.get("name"):
+            fields["name"] = body["name"].strip()
+        for k in ("short_name", "category", "specimen_type", "container", "remark"):
+            if body.get(k) is not None:
+                fields[k] = body[k]
+        if body.get("price_yuan") is not None:
+            fields["price_fen"] = money.to_fen(body["price_yuan"])
+        if body.get("settle_price_yuan") is not None:
+            fields["settle_price_fen"] = money.to_fen(body["settle_price_yuan"])
+        if body.get("report_days") is not None:
+            fields["report_days"] = int(body["report_days"] or 0) or None
+        if body.get("is_active") is not None:
+            fields["is_active"] = 1 if body["is_active"] else 0
+        require(fields, "没有要修改的字段")
+        sets = ", ".join("%s=?" % k for k in fields)
+        db.execute(conn, "UPDATE lab_item SET %s, updated_at=?, updated_by=? WHERE id=?" % sets,
+                   tuple(list(fields.values()) + [tu.now_str(), ctx.user_id, iid]))
+        for k, v in fields.items():
+            if row[k] != v:
+                audit.audit_data_change(conn, "lab_item", iid, k, row[k], v, body.get("reason"))
+        audit.audit_operation(conn, "M05", "lab.item.update", "lab_item", iid,
+                              detail={"fields": list(fields.keys())})
+    return {"id": iid, "changed": list(fields.keys())}
+
+
+@route("/api/lab/agency/update", "POST", perm="lab.agency.manage", module="M05",
+       action="lab.agency.update")
+def agency_update(ctx, body, q):
+    """改外送机构（名称 / 联系人 / 电话 / 启停用）。"""
+    aid = body.get("id")
+    require(aid, "缺少 id")
+    with db.tx() as conn:
+        row = db.query_one("SELECT * FROM lab_agency WHERE id=? AND deleted_at IS NULL", (aid,))
+        if row is None:
+            raise not_found("外送机构不存在")
+        fields = {}
+        if body.get("name"):
+            fields["name"] = body["name"].strip()
+        for k in ("contact", "phone", "address", "remark"):
+            if body.get(k) is not None:
+                fields[k] = body[k]
+        if body.get("is_active") is not None:
+            fields["is_active"] = 1 if body["is_active"] else 0
+        require(fields, "没有要修改的字段")
+        sets = ", ".join("%s=?" % k for k in fields)
+        db.execute(conn, "UPDATE lab_agency SET %s, updated_at=?, updated_by=? WHERE id=?" % sets,
+                   tuple(list(fields.values()) + [tu.now_str(), ctx.user_id, aid]))
+        for k, v in fields.items():
+            if row[k] != v:
+                audit.audit_data_change(conn, "lab_agency", aid, k, row[k], v, body.get("reason"))
+    return {"id": aid, "changed": list(fields.keys())}
+
+
 # ---------- F28 检查申请 ----------
 
 @route("/api/lab/order/create", "POST", perm="lab.order.create", module="M05",
