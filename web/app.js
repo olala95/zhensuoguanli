@@ -183,7 +183,7 @@ function renderWorkbench(items, errHtml) {
   const shown = wbFilter(WB.items).slice(0, 150);
   const rows = shown.map(v => `<tr>
     <td>${v.queue_no}</td>
-    <td>${esc(v.patient_name)} <span class="hint">${v.gender === 'F' ? '女' : v.gender === 'M' ? '男' : ''}${v.birth_date ? ' · ' + v.birth_date : ''}</span></td>
+    <td>${esc(v.patient_name)} ${MODE.chip(v)} <span class="hint">${v.gender === 'F' ? '女' : v.gender === 'M' ? '男' : ''}${v.birth_date ? ' · ' + v.birth_date : ''}</span></td>
     <td>${esc(v.patient_no)}</td>
     <td>${v.is_first_visit ? '<span class="tag muted">初诊</span>' : '<span class="tag muted">复诊</span>'}</td>
     <td>${statusTag(v.visit_status)}</td>
@@ -300,14 +300,23 @@ function rxSelectHtml(id, opts) {
     <option value="">— 先选就诊 —</option></select>`;
 }
 
-async function fillRxSelect(selId, visitId) {
+/* 处方类型归到哪一套流程：饮片/颗粒 = 中医，成药 = 西医 */
+function rxKindOf(t) { return (t === 'HERB' || t === 'GRANULE') ? 'TCM' : 'WEST'; }
+
+async function fillRxSelect(selId, visitId, favorKind) {
   const el = document.getElementById(selId);
   if (!el) return;
   el.innerHTML = '<option value="">加载中…</option>';
   if (!visitId) { el.innerHTML = '<option value="">— 先选就诊 —</option>'; return; }
   try {
-    const items = (await api('/api/prescription/list', { visit_id: visitId }, 'GET')).items || [];
+    let items = (await api('/api/prescription/list', { visit_id: visitId }, 'GET')).items || [];
     if (!items.length) { el.innerHTML = '<option value="">该就诊没有处方</option>'; return; }
+    // 中药房只管饮片/颗粒，西药房只管成药：本流程有对应处方时只列它们，
+    // 没有就退回显示全部（不给"发药发不了"的死局）
+    if (favorKind) {
+      const same = items.filter(r => rxKindOf(r.prescription_type) === favorKind);
+      if (same.length) items = same;
+    }
     // 自动选中可发药的那一张（优先已确认未发药的），省掉「展开下拉再挑」这一步
     const pick = items.find(r => r.status === 'CONFIRMED')
       || items.find(r => ['DISPENSED', 'PARTIAL_RETURNED'].indexOf(r.status) >= 0)
@@ -353,7 +362,7 @@ async function doSearchPatient(kw) {
   const rows = d.items.map(p => `<tr>
     <td>${esc(p.name)}</td><td>${p.gender === 'F' ? '女' : '男'}</td><td>${esc(p.birth_date || '')}</td>
     <td>${esc(p.phone || '')}</td><td>${esc(p.patient_no)}</td><td>${esc(p.id_card_no || '')}</td>
-    <td><button class="btn sm" onclick="newVisit(${p.id})">建就诊</button>
+    <td><button class="btn sm" onclick="newVisit(${p.id})">建${MODE.def === 'WEST' ? '西医' : '中医'}就诊</button>
         <button class="btn sm ghost" onclick="showPatient(${p.id})">资料</button></td>
   </tr>`).join('');
   $('#searchResult').innerHTML = d.items.length
@@ -458,8 +467,9 @@ async function ptDelete(id) {
 }
 async function newVisit(patientId) {
   try {
-    const v = await api('/api/visit/create', { patient_id: patientId, visit_type: 'TCM' });
-    toast('已建就诊 ' + v.visit_no, 'ok');
+    const v = await api('/api/visit/create',
+      { patient_id: patientId, visit_type: MODE.def });
+    toast('已建' + (MODE.def === 'WEST' ? '西医' : '中医') + '就诊 ' + v.visit_no, 'ok');
     render();
   } catch (e) { toast(e.message, 'err'); }
 }
@@ -526,6 +536,8 @@ async function viewRecord(visitId) {
   // 而路由里的 #/record/<id> 是 visit_id，两者不是一回事，
   // 混用会去查一个不存在的病历（控制台 404、归档信息空白）。
   LAST_RECORD_ID = rid;
+  // 本次就诊走中医还是西医：决定默认展开哪一套字段（另一套收起来，点开仍可补录）
+  const isTcm = MODE.isTcm(v);
   const cc = r.chief_complaint || {}, pi = r.present_illness || {}, tf = r.tcm_four || {};
   const vit = (r.vitals && r.vitals[0]) || {};
   const locked = r.status !== 'DRAFT';
@@ -549,9 +561,14 @@ async function viewRecord(visitId) {
 
   return `
   <div class="card">
-    <h3>接诊 · ${esc(v.patient_name)} ${esc(v.patient_no)} · 就诊号 ${esc(v.visit_no)} ${statusTag(r.status)}</h3>
+    <h3>接诊 · ${esc(v.patient_name)} ${esc(v.patient_no)} · 就诊号 ${esc(v.visit_no)} ${MODE.chip(v)} ${statusTag(r.status)}</h3>
     <div class="row">
       <span class="hint">${v.is_first_visit ? '初诊' : '复诊'} · 登记 ${fmtTime(v.registered_at)}</span>
+      <span class="hint">诊疗类型</span>
+      <button class="btn sm ${isTcm ? '' : 'ghost'}"
+        onclick="changeVisitType(${v.id},'TCM')">中医</button>
+      <button class="btn sm ${isTcm ? 'ghost' : ''}"
+        onclick="changeVisitType(${v.id},'WEST')">西医</button>
       <span class="spacer"></span>
       ${locked ? '<span class="tag warn">病历已确认，内容锁定</span>' : `<button class="btn ghost" onclick="saveAll(${rid})">保存</button>
         <button class="btn warn" onclick="confirmFlow(${rid})">确认签名（先自动保存）</button>`}
@@ -605,6 +622,8 @@ async function viewRecord(visitId) {
       <div><label>缓解因素</label><input id="pi_rel" value="${esc(pi.relieve || '')}" ${locked ? 'disabled' : ''}></div>
     </div>
 
+    <details class="grp-tcm" ${isTcm ? 'open' : ''}>
+    <summary class="section-title tcm" style="cursor:pointer;display:list-item">中医：四诊 / 辨证论治 / 中医诊断（F108 · F109）${isTcm ? '' : '—— 本次是西医就诊，点开可补录'}</summary>
     <div class="section-title tcm">中医四诊（望闻问切 · F108）</div>
     <div class="grid3">
       <div><label>望（神色形态）</label><textarea id="tf_ins" ${locked ? 'disabled' : ''}>${esc(tf.inspection || '')}</textarea></div>
@@ -627,16 +646,21 @@ async function viewRecord(visitId) {
       <div><label>治法/方剂</label><input id="syn_meth" value="${esc((r.syndromes && r.syndromes[0] && r.syndromes[0].treatment_method) || '')}" ${locked ? 'disabled' : ''}></div>
     </div>
 
+    <div class="grid3">
+      <div><label>中医病 / 证</label><input id="dx_tcm" value="${esc((r.diagnoses || []).filter(d => d.diag_type === 'TCM').map(d => d.tcm_name).join('') || '')}" ${locked ? 'disabled' : ''}></div>
+    </div>
+    </details>
+
+    <details class="grp-west" ${isTcm ? '' : 'open'}>
+    <summary class="section-title" style="cursor:pointer;display:list-item">西医：诊断 / 体格检查 / 辅助检查（F14 · F15 · F16 · F17）${isTcm ? '—— 本次是中医就诊，点开可补录' : ''}</summary>
     <div class="section-title">诊断（F17）</div>
     <div class="grid3">
       <div><label>西医诊断（名称）</label><input id="dx_west" value="${esc((r.diagnoses || []).filter(d => d.diag_type === 'WEST').map(d => d.icd10_name).join('') || '')}" ${locked ? 'disabled' : ''}></div>
       <div><label>ICD-10 编码</label><input id="dx_code" value="${esc((r.diagnoses || []).filter(d => d.diag_type === 'WEST').map(d => d.icd10_code).join('') || '')}" ${locked ? 'disabled' : ''}></div>
-      <div><label>中医病/证</label><input id="dx_tcm" value="${esc((r.diagnoses || []).filter(d => d.diag_type === 'TCM').map(d => d.tcm_name).join('') || '')}" ${locked ? 'disabled' : ''}></div>
     </div>
     <div class="hint">当前诊断：${dx}</div>
 
-    <details>
-    <summary class="section-title" style="cursor:pointer;display:list-item">生命体征 / 查体 / 辅助检查（F14-F16）—— 需要时展开</summary>
+    <div class="section-title">生命体征 / 查体 / 辅助检查（F14-F16）</div>
     <div class="grid3">
       <div><label>体温 ℃</label><input id="vs_t" value="${esc(vit.temperature_c || '')}" ${locked ? 'disabled' : ''}></div>
       <div><label>脉搏 次/分</label><input id="vs_p" value="${esc(vit.pulse || '')}" ${locked ? 'disabled' : ''}></div>
@@ -1423,6 +1447,10 @@ async function rxLoad() {
   await loadCatalog();
   try {
     const v = await api('/api/visit/get', { id: RX_STATE.visitId }, 'GET');
+    // 处方类型跟着就诊类型走：中医就诊只给饮片/颗粒，西医就诊只给成药
+    const isTcmVisit = MODE.isTcm(v);
+    if (isTcmVisit && RX_STATE.rxType === 'WEST') RX_STATE.rxType = 'HERB';
+    if (!isTcmVisit) RX_STATE.rxType = 'WEST';
     const list = (await api('/api/prescription/list', { visit_id: RX_STATE.visitId }, 'GET')).items || [];
     const rows = list.map(r => `<tr>
       <td>${esc(r.prescription_no)}</td>
@@ -1442,12 +1470,14 @@ async function rxLoad() {
         <div class="k">就诊</div><div>${esc(v.visit_no)} ${statusTag(v.status)}</div>
       </div>
       ${rxSeedBanner()}
-      <div class="section-title" style="margin-top:12px">新建处方</div>
+      <div class="section-title" style="margin-top:12px">新建处方 ${MODE.chip(v)}</div>
       <div class="row">
-        <select id="rx_type" style="width:150px">
-          <option value="HERB"${(RX_STATE.rxType || 'HERB') === 'HERB' ? ' selected' : ''}>饮片方（中药）</option>
-          <option value="GRANULE"${RX_STATE.rxType === 'GRANULE' ? ' selected' : ''}>颗粒方</option>
-          <option value="WEST"${RX_STATE.rxType === 'WEST' ? ' selected' : ''}>成药方</option></select>
+        <select id="rx_type" style="width:170px">
+          ${isTcmVisit
+            ? `<option value="HERB"${RX_STATE.rxType !== 'GRANULE' ? ' selected' : ''}>饮片方（中药）</option>
+               <option value="GRANULE"${RX_STATE.rxType === 'GRANULE' ? ' selected' : ''}>颗粒方</option>`
+            : `<option value="WEST" selected>成药方（西药 / 中成药）</option>`}
+        </select>
         <input id="rx_doses" placeholder="付数" style="width:80px" value="${esc(RX_STATE.doses || '7')}" onchange="rxFieldChanged()">
         <input id="rx_decoction" placeholder="煎法：水煎" style="flex:1" value="${esc(RX_STATE.decoction || '水煎')}" onchange="rxFieldChanged()">
         <input id="rx_admin" placeholder="服法：每日一剂分两次温服" style="flex:1" value="${esc(RX_STATE.admin || '')}" onchange="rxFieldChanged()">
@@ -2668,7 +2698,10 @@ async function viewPharmacy() {
   </div>
 
   <div class="card">
-    <h3>发药 / 退药（F51 / F115 / F46）</h3>
+    <h3>发药 / 退药（F51 / F115 / F46）· 当前药房：
+      <span class="tag ${MODE.def === 'WEST' ? 'west' : 'tcm'}">${MODE.def === 'WEST' ? '西药 / 成药' : '中药饮片'}</span>
+      <button class="btn sm ghost" onclick="setMode('${MODE.def === 'WEST' ? 'TCM' : 'WEST'}')">切到${MODE.def === 'WEST' ? '中药房' : '西药房'}</button>
+    </h3>
     <div class="row">
       ${visitSelectHtml('ph_visit', { selected: P3.visitId, onchange: 'phVisitChanged()' })}
       <select id="rx_id" class="pick" onchange="phLoadRx()"><option value="">— 先选就诊 —</option></select>
@@ -2894,7 +2927,8 @@ async function phVisitChanged() {
   const vid = val('ph_visit');
   P3.visitId = vid;
   P3.rxId = 0;
-  await fillRxSelect('rx_id', vid);
+  // 中药房默认只列中药方，西药房只列成药方（药房页顶部可切模式）
+  await fillRxSelect('rx_id', vid, MODE.def === 'WEST' ? 'WEST' : 'TCM');
   const sel = document.getElementById('rx_id');
   if (sel && sel.value) { await phLoadRx(); }   // 处方带出来后直接读，不用再点「读取处方」
   else if (vid) { document.getElementById('rx_info').innerHTML = '该就诊还没有处方，请医生先开方'; }
@@ -3684,9 +3718,15 @@ function rpRender(kind, d) {
       || '<tr><td class="empty" colspan="4">无数据</td></tr>'}</tbody></table>`;
   }
   if (kind === 'visit') {
+    const typeName = t => t === 'TCM' ? '中医' : (t === 'WEST' ? '西医' : '未分类（旧数据）');
     return `<table><tbody><tr><th>就诊人次</th><td><b>${esc(d.summary.visit_count)}</b></td>
       <th>初诊</th><td>${esc(d.summary.first_visit)}</td>
       <th>复诊率</th><td>${esc(d.summary.revisit_rate)}%</td></tr></tbody></table>
+      <h4 style="margin-top:10px">按诊疗类型</h4>
+      <table><thead><tr><th>类型</th><th>人次</th></tr></thead><tbody>${
+      (d.by_type || []).map(t => `<tr><td>${esc(typeName(t.visit_type))}</td>
+        <td>${esc(t.count)}</td></tr>`).join('')
+      || '<tr><td class="empty" colspan="2">无数据</td></tr>'}</tbody></table>
       <h4 style="margin-top:10px">趋势</h4>
       <table><thead><tr><th>期间</th><th>人次</th><th>初诊</th><th>复诊</th></tr></thead><tbody>${
       (d.trend || []).map(r => `<tr><td>${esc(r.period)}</td><td>${esc(r.total)}</td>
@@ -3725,8 +3765,12 @@ function rpRender(kind, d) {
       <tr><th>平均味数</th><td>${esc(s.avg_herb_lines)}</td><th>平均付数</th><td>${esc(s.avg_doses)}</td></tr>
       </tbody></table>
       <table><thead><tr><th>类型</th><th>数量</th><th>占比</th><th>金额(元)</th></tr></thead><tbody>${
-      (d.by_type || []).map(r => `<tr><td>${esc(r.prescription_type)}</td><td>${esc(r.count)}</td>
-        <td>${esc(r.count_pct)}%</td><td>${esc(r.amount_yuan)}</td></tr>`).join('')
+      (d.by_type || []).map(r => {
+        const cn = { HERB: '饮片方（中医）', GRANULE: '颗粒方（中医）', WEST: '成药方（西医）' }[r.prescription_type]
+          || r.prescription_type;
+        return `<tr><td>${esc(cn)}</td><td>${esc(r.count)}</td>
+        <td>${esc(r.count_pct)}%</td><td>${esc(r.amount_yuan)}</td></tr>`;
+      }).join('')
       || '<tr><td class="empty" colspan="4">无数据</td></tr>'}</tbody></table>`;
   }
   const s = d.summary;
@@ -3775,6 +3819,43 @@ function can(perm) {
   return p.indexOf(perm) >= 0;
 }
 
+/* ---------- 中西医双模式 ----------
+   中医和西医的字段、处方类型、发药队列本来就不是一套东西，挤在一屏最容易点错。
+   模式由就诊类型（visit.visit_type）驱动：TCM 中医 / WEST 西医 / NORMAL 旧数据按西医通用。
+   还没挂号时（没有就诊上下文）用上次选的默认模式。 */
+const MODE = {
+  key: 'clinic_visit_mode',
+  get def() { return localStorage.getItem(MODE.key) || 'TCM'; },
+  setDef(m) { localStorage.setItem(MODE.key, m); },
+  of(v) {
+    const t = v && v.visit_type;
+    return (t === 'WEST' || t === 'TCM') ? t : (t === 'NORMAL' ? 'WEST' : MODE.def);
+  },
+  isTcm(v) { return MODE.of(v) === 'TCM'; },
+  label(v) { return MODE.of(v) === 'WEST' ? '西医' : '中医'; },
+  chip(v) {
+    const m = MODE.of(v);
+    return m === 'TCM'
+      ? '<span class="tag tcm">中医</span>'
+      : '<span class="tag west">西医</span>';
+  }
+};
+
+function setMode(m) {
+  MODE.setDef(m);
+  toast('已切换到「' + (m === 'WEST' ? '西医' : '中医') + '」模式', 'ok');
+  render();
+}
+
+/* 病历页/开方页顶部：显示并允许纠正这次就诊的诊疗类型 */
+async function changeVisitType(visitId, to) {
+  try {
+    await api('/api/visit/set_type', { visit_id: visitId, visit_type: to });
+    toast('已切换为「' + (to === 'WEST' ? '西医' : '中医') + '」诊疗', 'ok');
+    render();
+  } catch (e) { toast(e.message, 'err'); }
+}
+
 function layout(inner) {
   const u = S.user || {};
   const all = [
@@ -3795,6 +3876,12 @@ function layout(inner) {
   <div class="topbar">
     <span class="clinic">${esc((S.sys && S.sys.clinic_name) || '中医诊所')}</span>
     <span class="hint">门诊管理系统</span>
+    <span class="modesw" title="决定新挂号走中医还是西医流程">
+      <button class="btn sm ${MODE.def === 'TCM' ? '' : 'ghost'}"
+        onclick="setMode('TCM')">中医</button>
+      <button class="btn sm ${MODE.def === 'WEST' ? '' : 'ghost'}"
+        onclick="setMode('WEST')">西医</button>
+    </span>
     <span class="spacer"></span>
     <span class="who" title="账号被授予的全部角色">${esc(u.display_name || '')} · ${esc(roles)}</span>
     <button class="btn sm ghost" onclick="doLock()">锁屏</button>

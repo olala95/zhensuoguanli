@@ -7,7 +7,8 @@
 
 from core import db, audit, timeutil as tu, ids
 from core.api import route
-from core.errors import require, AppError, conflict, not_found, BIZ_STATE_INVALID
+from core.errors import (require, AppError, conflict, not_found, BIZ_STATE_INVALID,
+                         DATA_REQUIRED)
 
 WAITING = "WAITING"
 IN_PROGRESS = "IN_PROGRESS"
@@ -67,9 +68,16 @@ def reassign_patient(conn, old_patient_id, new_patient_id, reason=None):
 
 @route("/api/visit/create", "POST", perm="visit.create", module="M02", action="visit.create")
 def create(ctx, body, q):
-    """F05 创建 Visit：当日流水号 V{yyyyMMdd}{3位}，自动生成候诊号。"""
+    """F05 创建 Visit：当日流水号 V{yyyyMMdd}{3位}，自动生成候诊号。
+
+    visit_type 决定这次就诊走中医还是西医流程（TCM/WEST），下游的病历字段、
+    处方类型、药房发药队列都按它分开；NORMAL 为历史数据兼容值，按西医通用处理。
+    """
     patient_id = body.get("patient_id")
     require(patient_id, "缺少 patient_id")
+    visit_type = body.get("visit_type") or "TCM"
+    require(visit_type in ("TCM", "WEST", "NORMAL"),
+            "visit_type 取值应为 TCM（中医）/ WEST（西医）", code=DATA_REQUIRED)
     with db.tx() as conn:
         p = db.query_one("SELECT id, name FROM patient WHERE id=? AND deleted_at IS NULL",
                          (patient_id,))
@@ -112,6 +120,33 @@ def create(ctx, body, q):
                    (tu.now_str(), tu.now_str(), patient_id))
         v = db.query_one("SELECT * FROM visit WHERE id=?", (vid,))
     return dict(v)
+
+
+@route("/api/visit/set_type", "POST", perm="visit.create", module="M02",
+       action="visit.set_type")
+def set_type(ctx, body, q):
+    """切换就诊的中医/西医类型（建错类型时改，不用重建就诊）。
+
+    已开处方、已写病历都不动；只改这次就诊走哪套流程的呈现。
+    """
+    vid = body.get("visit_id")
+    require(vid, "缺少 visit_id")
+    vt = body.get("visit_type")
+    require(vt in ("TCM", "WEST"), "visit_type 取值应为 TCM（中医）/ WEST（西医）",
+            code=DATA_REQUIRED)
+    with db.tx() as conn:
+        v = db.query_one("SELECT * FROM visit WHERE id=? AND deleted_at IS NULL", (vid,))
+        if v is None:
+            raise not_found("就诊不存在")
+        if v["status"] in (COMPLETED, VOID):
+            raise conflict("已完成或已作废的就诊不能再改诊疗类型", code=BIZ_STATE_INVALID)
+        if v["visit_type"] == vt:
+            return {"visit_id": vid, "visit_type": vt, "changed": False}
+        audit.audit_data_change(conn, "visit", vid, "visit_type", v["visit_type"], vt,
+                                body.get("reason") or "切换中医/西医类型")
+        db.execute(conn, "UPDATE visit SET visit_type=?, updated_at=?, updated_by=? "
+                         "WHERE id=?", (vt, tu.now_str(), ctx.user_id, vid))
+    return {"visit_id": vid, "visit_type": vt, "changed": True}
 
 
 @route("/api/visit/queue", "GET", perm="visit.view", module="M02", action="visit.queue")

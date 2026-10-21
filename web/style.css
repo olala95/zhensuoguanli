@@ -73,6 +73,13 @@ tbody tr:hover { background: #f7fafd; }
 .tag.danger { color: var(--danger); border-color: var(--danger); }
 .tag.muted { color: var(--muted); border-color: var(--line); }
 .tcm { color: var(--tcm); font-weight: 600; }
+.tag.tcm { color: var(--tcm); border-color: var(--tcm); }
+.tag.west { color: #0e7c86; border-color: #0e7c86; }
+.modesw { display: inline-flex; gap: 2px; margin-left: 14px; padding: 2px;
+  border: 1px solid var(--line); border-radius: 6px; background: #f7f9fc; }
+.modesw .btn { min-width: 52px; }
+.card.tcmcard { border-left: 3px solid var(--tcm); }
+.card.westcard { border-left: 3px solid #0e7c86; }
 
 .login-wrap { max-width: 380px; margin: 10vh auto; }
 .login-wrap .card { padding: 24px; }
