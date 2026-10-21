@@ -3203,8 +3203,16 @@ async function phTxns() {
 }
 
 /* ===== 处置 ===== */
+let TR_ITEMS = [];
+let TR_PKG_NAME = '';
+const TR_CAT_CN = { TCM: '中医操作', PHYSIO: '理疗', INJECTION: '注射',
+                    DRESSING: '换药', NEBULIZE: '雾化', EXAM: '检查', OTHER: '其他' };
+
 async function viewTreatment() {
   try { await loadVisitChoices(); } catch (e) { }
+  try {
+    TR_ITEMS = (await api('/api/treatment/item/list', {}, 'GET')).items || [];
+  } catch (e) { TR_ITEMS = []; }
   return `
   <div class="card">
     <h3>开立处置（F52/F54）</h3>
@@ -3238,27 +3246,50 @@ async function viewTreatment() {
   </div>
 
   <div class="card">
-    <h3>处置项目与套餐维护（F52）</h3>
+    <h3>处置项目目录（F52）· 共 ${TR_ITEMS.length} 项</h3>
+    <details style="margin-bottom:8px">
+      <summary class="hint">＋ 新增处置项目（点开填写，一次填完再提交）</summary>
+      <div class="row" style="margin-top:8px">
+        <input id="ti_code" placeholder="项目编码，如 ZJ001" style="width:160px">
+        <input id="ti_name" placeholder="项目名称，如 普通针刺" style="width:200px">
+        <select id="ti_cat" style="width:130px">
+          <option value="TCM">中医操作</option>
+          <option value="PHYSIO">理疗</option>
+          <option value="INJECTION">注射</option>
+          <option value="DRESSING">换药</option>
+          <option value="NEBULIZE">雾化</option>
+          <option value="EXAM">检查</option>
+          <option value="OTHER">其他</option>
+        </select>
+        <input id="ti_price" placeholder="单价 元" style="width:110px">
+        <input id="ti_min" placeholder="耗时 分钟" style="width:120px">
+        <label class="hint"><input type="checkbox" id="ti_istcm" checked> 中医操作（需填治疗记录）</label>
+        <button class="btn sm" onclick="trItemCreate2()">添加项目</button>
+      </div>
+      <div class="hint">勾「中医操作」的项目，在中医就诊下才出现，并且完成时必须填写针灸穴位/手法等结构化记录。</div>
+    </details>
+    <table class="tbl">
+      <thead><tr><th>项目</th><th>编码</th><th>类别</th><th>归属</th><th>单价(元)</th>
+        <th>耗时</th><th>状态</th><th>操作</th></tr></thead>
+      <tbody>${TR_ITEMS.map(x => `<tr>
+        <td>${esc(x.name)}</td>
+        <td class="hint">${esc(x.item_code || '')}</td>
+        <td>${esc(TR_CAT_CN[x.category] || x.category || '')}</td>
+        <td>${Number(x.is_tcm) === 1 ? '<span class="tag tcm">中医</span>' : '<span class="tag west">西医</span>'}</td>
+        <td>${esc(yuan(x.price_fen))}</td>
+        <td>${x.duration_min ? esc(x.duration_min) + ' 分' : '-'}</td>
+        <td>${x.is_active ? '<span class="tag ok">启用</span>' : '<span class="tag muted">停用</span>'}</td>
+        <td><button class="btn sm ghost" onclick="trItemEdit(${x.id})">修改</button></td>
+      </tr>`).join('') || '<tr><td colspan="8" class="hint">还没有处置项目，点上面「新增处置项目」添加</td></tr>'}</tbody>
+    </table>
+
+    <h3 style="margin-top:14px">处置套餐（F53）</h3>
     <div class="row">
-      <input id="ti_code" placeholder="编码" style="width:110px">
-      <input id="ti_name" placeholder="名称" style="width:160px">
-      <input id="ti_price" placeholder="单价（元）" style="width:110px">
-      <select id="ti_cat" style="width:120px">
-        <option value="GENERAL">通用</option><option value="TCM">中医</option>
-        <option value="NURSING">护理</option></select>
-      <button class="btn sm" onclick="trItemCreate()">新增项目</button>
-    </div>
-    <div class="row">
-      <input id="ti_id" placeholder="项目 ID（改价用）" style="width:130px">
-      <input id="ti_price2" placeholder="新单价（元）" style="width:120px">
-      <button class="btn sm ghost" onclick="trItemUpdate()">修改项目</button>
-    </div>
-    <div class="row">
-      <input id="tp_name" placeholder="套餐名称" style="width:160px">
-      <input id="tp_items" placeholder="项目 ID 列表，逗号分隔" style="flex:1">
-      <button class="btn sm ghost" onclick="trPkgCreate()">新建套餐</button>
+      <input id="tp_name" placeholder="套餐名称，如 颈椎病基础套" style="width:220px">
+      <button class="btn sm ghost" onclick="trPkgCreate2()">新建套餐</button>
       <button class="btn sm ghost" onclick="trPkgList()">套餐列表</button>
     </div>
+    <div class="hint">新建时勾选要包含的项目，不用再手填项目 ID。</div>
     <div id="tr_maint" class="hint"></div>
   </div>
 
@@ -3288,11 +3319,109 @@ async function trItemCreate() {
     toast('已新增处置项目', 'ok');
   } catch (e) { toast(e.message, 'err'); }
 }
-async function trItemUpdate() {
-  const id = parseInt(val('ti_id')); if (!id) { toast('填项目 ID', 'err'); return; }
-  try { await api('/api/treatment/item/update', { id: id,
-    price_fen: Math.round(parseFloat(val('ti_price2') || 0) * 100) }); toast('已更新', 'ok'); }
-  catch (e) { toast(e.message, 'err'); }
+
+/* ---------- 处置项目维护（F52）：列表 + 表单，不再手填项目 ID ---------- */
+async function trItemCreate2() {
+  const name = (val('ti_name') || '').trim();
+  if (!name) { toast('项目名称必填', 'err'); return; }
+  const code = (val('ti_code') || '').trim();
+  try {
+    await api('/api/treatment/item/create', {
+      item_code: code || null, name: name, category: val('ti_cat'),
+      price_yuan: parseFloat(val('ti_price') || 0),
+      duration_min: parseInt(val('ti_min'), 10) || null,
+      is_tcm: document.getElementById('ti_istcm').checked ? 1 : 0,
+      need_record: document.getElementById('ti_istcm').checked ? 1 : 0,
+    });
+    toast('已添加处置项目：' + name, 'ok');
+    render();
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+function trItemEdit(id) {
+  const it = (TR_ITEMS || []).find(x => x.id === id);
+  if (!it) { toast('项目不存在，请刷新', 'err'); return; }
+  const cats = Object.keys(TR_CAT_CN);
+  modal('修改处置项目 · ' + it.name, `
+    <div class="grid3">
+      <div><label>名称</label><input id="eti_name" value="${esc(it.name)}"></div>
+      <div><label>类别</label><select id="eti_cat">${
+        cats.map(c => `<option value="${c}"${it.category === c ? ' selected' : ''}>${TR_CAT_CN[c]}</option>`).join('')
+      }</select></div>
+      <div><label>单价（元）</label><input id="eti_price" value="${((it.price_fen || 0) / 100).toFixed(2)}"></div>
+      <div><label>耗时（分钟）</label><input id="eti_min" value="${it.duration_min != null ? it.duration_min : ''}"></div>
+      <div><label>归属</label><select id="eti_tcm">
+        <option value="1"${Number(it.is_tcm) === 1 ? ' selected' : ''}>中医操作（需治疗记录）</option>
+        <option value="0"${Number(it.is_tcm) !== 1 ? ' selected' : ''}>西医操作</option></select></div>
+      <div><label>完成时必填记录</label><select id="eti_rec">
+        <option value="1"${Number(it.need_record) === 1 ? ' selected' : ''}>需要</option>
+        <option value="0"${Number(it.need_record) !== 1 ? ' selected' : ''}>不需要</option></select></div>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <button class="btn" onclick="trItemSave(${id})">保存</button>
+      <button class="btn ${it.is_active ? 'warn' : 'ghost'}"
+        onclick="trItemToggle(${id},${it.is_active ? 0 : 1})">${it.is_active ? '停用此项目' : '重新启用'}</button>
+    </div>
+    <div class="hint">改价不追溯已开立的执行记录；已完成的按当时价格结算。</div>`);
+}
+
+async function trItemSave(id) {
+  try {
+    await api('/api/treatment/item/update', {
+      id: id,
+      name: (val('eti_name') || '').trim() || null,
+      category: val('eti_cat'),
+      price_fen: Math.round(parseFloat(val('eti_price') || 0) * 100),
+      duration_min: parseInt(val('eti_min'), 10) || null,
+      is_tcm: Number(val('eti_tcm')),
+      need_record: Number(val('eti_rec')),
+    });
+    toast('已保存', 'ok');
+    closeModal();
+    render();
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+async function trItemToggle(id, active) {
+  try {
+    await api('/api/treatment/item/update', { id: id, is_active: active });
+    toast(active ? '已重新启用' : '已停用（历史执行记录不受影响）', 'ok');
+    closeModal();
+    render();
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+function trPkgCreate2() {
+  const name = (val('tp_name') || '').trim();
+  if (!name) { toast('请先填套餐名称', 'err'); return; }
+  const list = (TR_ITEMS || []).filter(x => x.is_active);
+  if (!list.length) { toast('还没有可用的处置项目', 'err'); return; }
+  TR_PKG_NAME = name;
+  modal('新建套餐 · ' + name, `
+    <div class="hint">勾选这个套餐包含的项目，不用再手填项目 ID。</div>
+    <div style="max-height:320px;overflow:auto;margin-top:8px">
+      ${list.map(x => `<label style="display:block;padding:4px 0">
+        <input type="checkbox" class="tp_item" value="${x.id}">
+        ${esc(x.name)} ${Number(x.is_tcm) === 1 ? '<span class="tag tcm">中医</span>' : ''}
+        <span class="hint">${esc(yuan(x.price_fen))} 元</span></label>`).join('')}
+    </div>
+    <div class="row" style="margin-top:10px">
+      <button class="btn" onclick="trPkgDoCreate()">创建套餐</button>
+    </div>`);
+}
+
+async function trPkgDoCreate() {
+  const ids = Array.from(document.querySelectorAll('.tp_item:checked')).map(x => Number(x.value));
+  if (!ids.length) { toast('请至少勾选一个项目', 'err'); return; }
+  try {
+    const r = await api('/api/treatment/package/create', {
+      name: TR_PKG_NAME,
+      items: ids.map(id => ({ item_id: id, quantity: 1 })),
+    });
+    toast('套餐已创建：' + TR_PKG_NAME, 'ok');
+    closeModal();
+    render();
+  } catch (e) { toast(e.message, 'err'); }
 }
 async function trPkgCreate() {
   const name = val('tp_name'); if (!name) { toast('填套餐名称', 'err'); return; }

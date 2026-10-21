@@ -115,6 +115,17 @@ def item_search(ctx, body, q):
     return {"items": db.query(sql, params)}
 
 
+@route("/api/treatment/item/list", "GET", perm="treatment.view",
+       module=MODULE, action="treatment.item.list")
+def item_list(ctx, body, q):
+    """维护用清单：默认含停用项，避免「停用了就再也找不回来」。"""
+    sql = "SELECT * FROM treatment_item WHERE deleted_at IS NULL"
+    if not (q.get("include_inactive") in ("1", "true", "yes")):
+        sql += " AND is_active=1"
+    sql += " ORDER BY is_active DESC, is_tcm DESC, category, id LIMIT 500"
+    return {"items": db.query(sql)}
+
+
 @route("/api/treatment/item/update", "POST", perm="treatment.manage",
        module=MODULE, action="treatment.item.update")
 def item_update(ctx, body, q):
