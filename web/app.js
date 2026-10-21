@@ -867,9 +867,40 @@ async function saveAll(rid, silent) {
 }
 
 /* 确认签名前自动先保存：少点一次按钮，也避免「改了内容没保存就签名」这种丢数据的坑 */
+/* ---------- 签名口令：会话内免重复输入 ----------
+   单人诊所一个医生一天要签几十次字，每次手输口令是纯粹的重复劳动。
+   口令只存在当前浏览器标签页内存里（sessionStorage），关掉页面或超过 30 分钟即失效，
+   后端审计会记录本次签名是「手输」还是「会话内已验证」，事后可追溯。
+   想每次都输：在系统设置里把「记住签名口令」关掉即可。 */
+const SIGN_REMEMBER_MS = 30 * 60 * 1000;
+function signRememberOn() { return localStorage.getItem('clinic_sign_remember') !== '0'; }
+function signPwdGet() {
+  if (!signRememberOn()) return null;
+  try {
+    const at = parseInt(sessionStorage.getItem('clinic_sign_at') || '0', 10);
+    if (!at || Date.now() - at > SIGN_REMEMBER_MS) { signPwdClear(); return null; }
+    return sessionStorage.getItem('clinic_sign_pwd') || null;
+  } catch (e) { return null; }
+}
+function signPwdSet(p) {
+  if (!signRememberOn() || !p) return;
+  try {
+    sessionStorage.setItem('clinic_sign_pwd', p);
+    sessionStorage.setItem('clinic_sign_at', String(Date.now()));
+  } catch (e) { }
+}
+function signPwdClear() {
+  try {
+    sessionStorage.removeItem('clinic_sign_pwd');
+    sessionStorage.removeItem('clinic_sign_at');
+  } catch (e) { }
+}
+
 async function confirmFlow(rid) {
   const ok = await saveAll(rid, true);
   if (!ok) return;
+  const cached = signPwdGet();
+  if (cached) { await doConfirmRecord(rid, cached, 'SESSION'); return; }
   showConfirm(rid);
 }
 
@@ -952,14 +983,26 @@ async function removeExamRef(rid, id) {
 function showConfirm(rid) {
   modal('病历确认签名（F19）', `
     <div class="hint">确认后病历内容锁定，修改需走病历修改留痕流程。请输入登录口令作为签名凭据。</div>
-    <div class="row" style="margin-top:10px"><input id="sign_pwd" type="password" placeholder="登录口令"></div>
-    <div class="row"><button class="btn" onclick="confirmRecord(${rid})">确认签名</button></div>`);
+    <div class="row" style="margin-top:10px"><input id="sign_pwd" type="password" placeholder="登录口令"
+      onkeydown="if(event.key==='Enter')confirmRecord(${rid})"></div>
+    <div class="row"><button class="btn" onclick="confirmRecord(${rid})">确认签名</button>
+      <span class="hint">${signRememberOn() ? '本次签名后 30 分钟内免再输（仅存于本标签页）' : ''}</span></div>`);
 }
 async function confirmRecord(rid) {
+  const p = val('sign_pwd');
+  if (!p) { toast('请输入登录口令', 'err'); return; }
+  await doConfirmRecord(rid, p, 'INPUT');
+}
+async function doConfirmRecord(rid, pwd, src) {
   try {
-    await api('/api/record/confirm', { record_id: rid, password: val('sign_pwd') });
+    await api('/api/record/confirm', { record_id: rid, password: pwd, pw_source: src });
+    signPwdSet(pwd);
     toast('病历已确认并签名', 'ok'); closeModal(); render();
-  } catch (e) { toast(e.message, 'err'); }
+  } catch (e) {
+    // 会话缓存的口令失效（改过密码）→ 清掉，退回手输，不要死循环
+    if (src === 'SESSION') { signPwdClear(); toast(e.message, 'err'); showConfirm(rid); return; }
+    toast(e.message, 'err');
+  }
 }
 async function suspendVisit(id) {
   const reason = prompt('挂单/留观原因（必填）：');
@@ -1084,7 +1127,8 @@ async function voidVisit(id) {
 const RX_STATE = { visitId: 0, rxId: 0, rx: null, lines: [],
                    cand: [], candIdx: -1,
                    rxType: 'HERB', doses: '7', decoction: '水煎',
-                   admin: '每日一剂，分两次温服' };
+                   admin: '每日一剂，分两次温服',
+                   last: null, tpls: [], tplOpen: false };
 const CAT = { herbs: [], drugs: [], freqHerb: [], freqDrug: [], at: 0, loading: false, err: '' };
 
 async function loadCatalog(force) {
@@ -1450,6 +1494,8 @@ async function rxCreate() {
 async function rxOpen(id) {
   RX_STATE.rxId = id;
   await loadCatalog();
+  await rxLoadLast();
+  await rxLoadTpls();
   try {
     const rx = await api('/api/prescription/get', { id: id }, 'GET');
     RX_STATE.rx = rx;
@@ -1507,6 +1553,18 @@ async function rxRender() {
       ${isHerb ? '（饮片方）' : '（成药方）'}</div>
 
     ${locked ? '' : `
+    <div class="row" style="margin-top:6px">
+      ${RX_STATE.last ? `<button class="btn" onclick="rxCopyLast()">照上次方（${esc(RX_STATE.last.prescription_no)} · ${RX_STATE.last.count} 味）</button>` : ''}
+      ${RX_STATE.tpls.length
+        ? `<button class="btn ghost" onclick="rxTplToggle()">${isHerb ? '经典方' : '常用方'}（${RX_STATE.tpls.length}）</button>`
+        : `<button class="btn sm ghost" onclick="rxSeedTpls()">载入经典方</button>`}
+      <span class="hint">${RX_STATE.last ? '复诊：先照抄再加减，比一味味重打快得多' : '首诊：从经典方改，比空手起方快'}</span>
+    </div>
+    <div id="rx_tpls" class="chipbox" style="display:${RX_STATE.tplOpen ? 'block' : 'none'}">
+      ${RX_STATE.tpls.map(t => `<span class="chip" onclick="rxTplApplyOne(${t.id})">${esc(t.name)}${t.indication ? ' <span class="hint">' + esc(t.indication) + '</span>' : ''}</span>`).join('')
+      || '<span class="hint">还没有模板，点「载入经典方」一键预置 14 张常用方</span>'}
+    </div>
+
     <div class="row" style="margin-top:6px;position:relative">
       <input id="rx_fast" style="flex:1" autocomplete="off" placeholder="输入药名或拼音首字母，回车直接加入。例：黄芪 15 / 当归12 / hq15"
              oninput="rxFastInput(this.value)" onkeydown="return rxFastKey(event)">
@@ -1540,15 +1598,72 @@ async function rxRender() {
     </div>` : ''}
 
     <div class="row" style="margin-top:10px">
-      <button class="btn ghost" onclick="rxPrice(${rx.id})">计价</button>
-      <button class="btn ghost" onclick="rxCheck(${rx.id})">规则预检</button>
-      ${rx.status === 'DRAFT' ? `<button class="btn" onclick="rxSubmit(${rx.id})">提交</button>` : ''}
-      ${rx.status === 'PENDING' ? `<button class="btn warn" onclick="rxConfirm(${rx.id})">确认（需口令）</button>` : ''}
-      ${rx.status === 'DRAFT' ? `<button class="btn sm ghost" onclick="rxTplApply(${rx.id})">套用模板</button>` : ''}
+      ${rx.status === 'DRAFT' ? `<button class="btn" onclick="rxSubmit(${rx.id})">提交（自动计价+预检）</button>` : ''}
+      ${rx.status === 'PENDING' ? `<button class="btn warn" onclick="rxConfirm(${rx.id})">确认${signPwdGet() ? '（已记住口令）' : '（需口令）'}</button>` : ''}
+      <button class="btn sm ghost" onclick="rxCheck(${rx.id})">规则预检</button>
       <button class="btn sm ghost" onclick="rxSaveAsTpl(${rx.id})">存为模板</button>
       <button class="btn sm ghost" onclick="rxGuide(${rx.id})">用药指导</button>
     </div>
     <div id="rx_msg" class="hint"></div>`;
+}
+
+/* ---------- 开方提速：照上次方 / 经典方 ---------- */
+async function rxLoadLast() {
+  RX_STATE.last = null;
+  try {
+    const r = await api('/api/prescription/last', { visit_id: RX_STATE.visitId }, 'GET');
+    RX_STATE.last = (r && r.has_last) ? r : null;
+  } catch (e) { RX_STATE.last = null; }
+}
+
+async function rxLoadTpls() {
+  RX_STATE.tpls = [];
+  try {
+    const r = await api('/api/prescription/templates', {}, 'GET');
+    RX_STATE.tpls = r.items || [];
+  } catch (e) { RX_STATE.tpls = []; }
+}
+
+async function rxCopyLast() {
+  if (!RX_STATE.rxId) return;
+  try {
+    const r = await api('/api/prescription/copy_last', { prescription_id: RX_STATE.rxId });
+    const bits = [];
+    if (r.herbs) bits.push(r.herbs + ' 味饮片');
+    if (r.drugs) bits.push(r.drugs + ' 种成药');
+    toast('已照抄 ' + r.source_prescription_no + '：' + bits.join(' + '), 'ok');
+    if (r.skipped && r.skipped.length) toast('已停用、没照抄：' + r.skipped.join('、'), 'err');
+    await rxOpen(RX_STATE.rxId);
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+function rxTplToggle() {
+  RX_STATE.tplOpen = !RX_STATE.tplOpen;
+  const el = document.getElementById('rx_tpls');
+  if (el) el.style.display = RX_STATE.tplOpen ? 'block' : 'none';
+}
+
+async function rxTplApplyOne(tplId) {
+  if (!RX_STATE.rxId) return;
+  try {
+    await api('/api/prescription/template/apply',
+      { prescription_id: RX_STATE.rxId, template_id: tplId });
+    toast('已套用，可继续加减味', 'ok');
+    await rxOpen(RX_STATE.rxId);
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+async function rxSeedTpls() {
+  try {
+    const r = await api('/api/prescription/template/seed_classic', {});
+    toast('已预置 ' + r.total + ' 张经典方', 'ok');
+    if (r.missing && r.missing.length) {
+      toast('目录缺药未建：' + r.missing.map(m => m.name).join('、'), 'err');
+    }
+    await rxLoadTpls();
+    RX_STATE.tplOpen = true;
+    await rxRender();
+  } catch (e) { toast(e.message, 'err'); }
 }
 
 async function rxFreqAdd(id, dose) {
@@ -1585,10 +1700,18 @@ async function rxSubmit(id) {
 }
 
 async function rxConfirm(id) {
-  const pwd = prompt('确认处方需要签名口令：');
+  const cached = signPwdGet();
+  const pwd = cached || prompt('确认处方需要签名口令：');
   if (!pwd) return;
-  try { await api('/api/prescription/confirm', { prescription_id: id, password: pwd }); toast('处方已确认', 'ok'); await rxLoad(); await rxOpen(id); }
-  catch (e) { toast(e.message, 'err'); }
+  try {
+    await api('/api/prescription/confirm',
+      { prescription_id: id, password: pwd, pw_source: cached ? 'SESSION' : 'INPUT' });
+    signPwdSet(pwd);
+    toast('处方已确认', 'ok'); await rxLoad(); await rxOpen(id);
+  } catch (e) {
+    if (cached) signPwdClear();
+    toast(e.message, 'err');
+  }
 }
 
 async function rxVoid(id) {
@@ -2157,6 +2280,13 @@ async function showAudit(rid) {
 }
 
 /* ---------- 系统管理 ---------- */
+function toggleSignRemember(on) {
+  localStorage.setItem('clinic_sign_remember', on ? '1' : '0');
+  if (!on) signPwdClear();
+  const el = document.getElementById('sign_remember_state');
+  if (el) el.textContent = on ? '已开启：签名不再重复输口令' : '已关闭：每次签名都要输口令';
+}
+
 async function viewSystem() {
   let html = `
   <div class="card">
@@ -2167,6 +2297,11 @@ async function viewSystem() {
       <div class="k">迁移</div><div>已应用 ${S.sys.migrations_applied} 个${S.sys.migrations_pending.length ? '，待执行 ' + S.sys.migrations_pending.join(',') : ''}</div>
       <div class="k">安全模式</div><div>${S.sys.safe_mode ? '<span class="tag danger">只读</span>' : '<span class="tag ok">正常</span>'}</div>
       <div class="k">最近备份</div><div>${esc((S.sys.last_backup && S.sys.last_backup.started_at) || '无')}</div>
+      <div class="k">签名口令</div><div>
+        <label style="cursor:pointer"><input type="checkbox" id="sign_remember"
+          ${signRememberOn() ? 'checked' : ''} onchange="toggleSignRemember(this.checked)">
+        记住 30 分钟（仅本机当前标签页，关闭页面即失效）</label>
+        <span class="hint" id="sign_remember_state"></span></div>
     </div>
     <div class="row" style="margin-top:10px">
       <button class="btn ghost" onclick="runDiagnose()">系统诊断</button>

@@ -123,3 +123,9 @@ label.chk input[type=checkbox] { width: auto; margin: 0; }
 .cand.on { background: var(--primary); color: #fff; }
 .cand.on .hint { color: #e8f0fb; }
 input.dose { width: 74px; display: inline-block; }
+.chipbox { margin-top: 6px; padding: 6px 4px; border: 1px solid var(--line);
+  border-radius: 4px; background: #fff; max-height: 200px; overflow: auto; }
+.chip { display: inline-block; margin: 2px; padding: 4px 11px; border: 1px solid var(--line);
+  border-radius: 14px; cursor: pointer; font-size: 13px; }
+.chip:hover { background: #f0f4fa; border-color: var(--primary); }
+.chip .hint { font-size: 12px; }

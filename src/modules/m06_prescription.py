@@ -806,7 +806,8 @@ def confirm(ctx, body, q):
                 raise not_found("处方不存在")
             if rx["status"] != PENDING:
                 raise conflict("只有 PENDING 状态的处方可以确认", code=BIZ_ALREADY_CONFIRMED)
-            audit.audit_operation(conn, "M06", "prescription.confirm", "prescription", rx_id)
+            audit.audit_operation(conn, "M06", "prescription.confirm", "prescription", rx_id,
+                                  detail={"pw_source": body.get("pw_source", "INPUT")})
             blocks, warns, need_confirm = _validate(conn, rx, ctx, body)
             if blocks:
                 raise conflict("；".join([b["message"] for b in blocks]),
@@ -820,6 +821,8 @@ def confirm(ctx, body, q):
                                                 u["password_hash"]):
                     raise conflict("签名口令校验失败", code="E6003")
             pricing = _price(conn, rx, ctx)
+            # 注意：extra 的键会落进 prescription_status_log 的列，只能放表内已有字段；
+            # pw_source 只作为审计明细记录，不进状态日志表
             transition(conn, rx_id, CONFIRMED, body.get("reason") or "处方确认", ctx,
                        extra={"confirmed_by": ctx.user_id, "confirmed_at": tu.now_str(),
                               "sign_method": body.get("sign_method", "PASSWORD")})
@@ -1086,6 +1089,189 @@ def template_from_prescription(ctx, body, q):
         "decoction_method": rx.get("decoction_method"), "administration": rx.get("administration"),
         "source_prescription_no": rx["prescription_no"], "items": items,
     }, q)
+
+
+# ---------------- 开方提速：照上次方 / 经典协定方 ----------------
+# 中医诊所复诊占比极高，"原方再抓 / 原方加减"是最常见动作；首诊则需要开箱可用的
+# 协定方。两者都走复制语义：已停用或已删除的品目跳过并明确提示，绝不静默丢药。
+
+CLASSIC_FORMULAS = [
+    ("四君子汤", "健脾益气", "脾胃气虚",
+     [("党参", 15), ("白术", 12), ("茯苓", 12), ("炙甘草", 6)]),
+    ("四物汤", "养血调经", "血虚",
+     [("当归", 12), ("川芎", 9), ("白芍", 12), ("熟地黄", 15)]),
+    ("归脾汤", "益气补血、健脾养心", "心脾两虚",
+     [("黄芪", 30), ("党参", 15), ("白术", 12), ("茯苓", 15), ("酸枣仁", 15),
+      ("龙眼肉", 12), ("木香", 6), ("炙甘草", 6), ("当归", 12), ("远志", 6), ("大枣", 10)]),
+    ("补中益气汤", "补中益气、升阳举陷", "中气下陷",
+     [("黄芪", 30), ("党参", 15), ("白术", 12), ("当归", 12), ("陈皮", 9),
+      ("升麻", 6), ("柴胡", 9), ("炙甘草", 6)]),
+    ("逍遥散", "疏肝解郁、健脾养血", "肝郁脾虚",
+     [("柴胡", 12), ("当归", 12), ("白芍", 12), ("白术", 12), ("茯苓", 15),
+      ("薄荷", 6), ("生姜", 6), ("炙甘草", 6)]),
+    ("六味地黄丸", "滋补肾阴", "肾阴亏虚",
+     [("熟地黄", 24), ("山茱萸", 12), ("山药", 12), ("泽泻", 9), ("茯苓", 9), ("牡丹皮", 9)]),
+    ("杞菊地黄丸", "滋肾养肝明目", "肝肾阴虚",
+     [("熟地黄", 24), ("山茱萸", 12), ("山药", 12), ("泽泻", 9), ("茯苓", 9),
+      ("牡丹皮", 9), ("枸杞子", 12), ("菊花", 9)]),
+    ("二陈汤", "燥湿化痰、理气和中", "痰湿咳嗽",
+     [("法半夏", 12), ("陈皮", 12), ("茯苓", 15), ("甘草", 6), ("生姜", 6), ("乌梅", 3)]),
+    ("小柴胡汤", "和解少阳", "少阳证",
+     [("柴胡", 15), ("黄芩", 9), ("法半夏", 9), ("党参", 9), ("生姜", 9),
+      ("大枣", 10), ("炙甘草", 6)]),
+    ("桂枝汤", "解肌发表、调和营卫", "风寒表虚",
+     [("桂枝", 9), ("白芍", 9), ("生姜", 9), ("大枣", 10), ("炙甘草", 6)]),
+    ("银翘散", "辛凉透表、清热解毒", "风热感冒",
+     [("金银花", 15), ("连翘", 15), ("桔梗", 9), ("薄荷", 6), ("淡竹叶", 6),
+      ("荆芥", 9), ("牛蒡子", 9), ("芦根", 15), ("甘草", 6)]),
+    ("参苓白术散", "健脾益气、渗湿止泻", "脾虚湿盛",
+     [("党参", 15), ("白术", 12), ("茯苓", 15), ("山药", 15), ("莲子", 12),
+      ("白扁豆", 12), ("薏苡仁", 15), ("砂仁", 6), ("桔梗", 9), ("甘草", 6)]),
+    ("半夏厚朴汤", "行气散结、降逆化痰", "梅核气",
+     [("法半夏", 12), ("厚朴", 9), ("茯苓", 15), ("生姜", 9), ("紫苏叶", 6)]),
+    ("血府逐瘀汤", "活血化瘀、行气止痛", "气滞血瘀",
+     [("当归", 12), ("生地黄", 12), ("桃仁", 12), ("红花", 9), ("枳壳", 9),
+      ("赤芍", 9), ("柴胡", 9), ("甘草", 6), ("桔梗", 9), ("川芎", 9), ("牛膝", 12)]),
+]
+
+
+def _copy_items_from_prescription(ctx, rx_id, src_id, src_label, q):
+    """把 src 处方的明细复制到 rx 处方（复制语义，不共享引用）。"""
+    skipped, herbs, drugs = [], [], []
+    for h in db.query("SELECT * FROM herb_prescription_item WHERE prescription_id=? "
+                      "AND deleted_at IS NULL ORDER BY line_no", (src_id,)):
+        herb = db.query_one("SELECT * FROM herb WHERE id=? AND deleted_at IS NULL",
+                            (h["herb_id"],))
+        if herb is None or not herb["is_active"]:
+            skipped.append(h["herb_name_snap"])
+            continue
+        herbs.append({"herb_id": herb["id"], "dose_g": h["dose_g"],
+                      "foot_note": h["foot_note"] or "NORMAL"})
+    for it in db.query("SELECT * FROM prescription_item WHERE prescription_id=? "
+                       "AND deleted_at IS NULL ORDER BY line_no", (src_id,)):
+        d = db.query_one("SELECT * FROM drug WHERE id=? AND deleted_at IS NULL", (it["drug_id"],))
+        if d is None or not d["is_active"]:
+            skipped.append(it["drug_name_snap"])
+            continue
+        drugs.append({"drug_id": d["id"], "quantity": it["quantity"], "dosage": it["dosage"],
+                      "frequency": it["frequency"], "route": it["route"], "days": it["days"]})
+    src = db.query_one("SELECT * FROM prescription WHERE id=?", (src_id,))
+    with db.tx() as conn:
+        audit.audit_operation(conn, "M06", "prescription.copy_last", "prescription", rx_id,
+                              detail={"from": src_label, "skipped": skipped})
+        if src["prescription_type"] == "HERB":
+            db.execute(conn, "UPDATE prescription SET prescription_type='HERB', doses=?, "
+                             "decoction_method=COALESCE(?, decoction_method), "
+                             "administration=COALESCE(?, administration), "
+                             "updated_at=?, updated_by=? WHERE id=?",
+                       (src["doses"] or config.get_int("herb.default_doses", 7),
+                        src["decoction_method"], src["administration"],
+                        tu.now_str(), ctx.user_id, rx_id))
+    if drugs:
+        save_items(ctx, {"prescription_id": rx_id, "items": drugs}, q)
+    if herbs:
+        save_herbs(ctx, {"prescription_id": rx_id, "items": herbs,
+                         "doses": src["doses"]}, q)
+    return {"prescription_id": rx_id, "drugs": len(drugs), "herbs": len(herbs),
+            "skipped": skipped}
+
+
+@route("/api/prescription/copy_last", "POST", perm="prescription.edit", module="M06",
+       action="prescription.copy_last")
+def copy_last(ctx, body, q):
+    """复诊提速：把该患者最近一张有效处方照抄到当前草稿处方。
+
+    只读源、写目标，复制后仍是 DRAFT，医生可随意加减味再提交。
+    没有历史处方时明确报 E2005（前端据此隐藏按钮），不静默失败。
+    """
+    rx_id = body.get("prescription_id")
+    require(rx_id, "缺少 prescription_id")
+    rx = _load(rx_id)
+    src = db.query_one("""
+        SELECT p.* FROM prescription p
+        WHERE p.patient_id=? AND p.deleted_at IS NULL AND p.id<>?
+          AND p.status IN ('PENDING','CONFIRMED','DISPENSED','COMPLETED')
+        ORDER BY p.id DESC LIMIT 1
+    """, (rx["patient_id"], rx_id))
+    if src is None:
+        raise not_found("该患者还没有历史处方，无法照上次方")
+    out = _copy_items_from_prescription(ctx, rx_id, src["id"], src["prescription_no"], q)
+    out["source_prescription_no"] = src["prescription_no"]
+    out["source_prescription_id"] = src["id"]
+    return out
+
+
+@route("/api/prescription/last", "GET", perm="prescription.view", module="M06",
+       action="prescription.last")
+def last_by_patient(ctx, body, q):
+    """该患者最近一张有效处方的概要（前端用来显示「照上次方 Rxxx · 12味」）。"""
+    pid = q.get("patient_id") or body.get("patient_id")
+    vid = q.get("visit_id") or body.get("visit_id")
+    if not pid and vid:
+        v = db.query_one("SELECT patient_id FROM visit WHERE id=? AND deleted_at IS NULL", (vid,))
+        pid = v["patient_id"] if v else None
+    if not pid:
+        return {"has_last": False}
+    row = db.query_one("""
+        SELECT p.id, p.prescription_no, p.prescription_type, p.doses, p.occurred_at,
+               (SELECT COUNT(*) FROM herb_prescription_item h
+                WHERE h.prescription_id=p.id AND h.deleted_at IS NULL) herb_cnt,
+               (SELECT COUNT(*) FROM prescription_item i
+                WHERE i.prescription_id=p.id AND i.deleted_at IS NULL) drug_cnt
+        FROM prescription p
+        WHERE p.patient_id=? AND p.deleted_at IS NULL
+          AND p.status IN ('PENDING','CONFIRMED','DISPENSED','COMPLETED')
+        ORDER BY p.id DESC LIMIT 1
+    """, (pid,))
+    if row is None:
+        return {"has_last": False}
+    return {"has_last": True, "prescription_id": row["id"],
+            "prescription_no": row["prescription_no"],
+            "prescription_type": row["prescription_type"], "doses": row["doses"],
+            "occurred_at": row["occurred_at"],
+            "count": (row["herb_cnt"] or 0) + (row["drug_cnt"] or 0)}
+
+
+@route("/api/prescription/template/seed_classic", "POST",
+       perm="prescription.template.manage", module="M06",
+       action="prescription.template.seed_classic")
+def seed_classic_templates(ctx, body, q):
+    """预置经典协定方（幂等：同名模板已存在则跳过）。
+
+    新装系统模板库是空的，医生要自己攒才能受益——这里给一批开箱可用的常用方，
+    之后医生仍可改、可存自己的方。
+    """
+    created, skipped_exist, missing = [], [], []
+    for name, indication, syndrome, items in CLASSIC_FORMULAS:
+        exist = db.query_one("SELECT id FROM prescription_template WHERE name=? "
+                             "AND deleted_at IS NULL", (name,))
+        if exist:
+            skipped_exist.append(name)
+            continue
+        rows, miss = [], []
+        for herb_name, dose in items:
+            h = db.query_one("SELECT id, name FROM herb WHERE name=? AND deleted_at IS NULL "
+                             "AND is_active=1", (herb_name,))
+            if h is None:
+                miss.append(herb_name)
+                continue
+            rows.append({"item_kind": "HERB", "ref_id": h["id"], "dose_g": dose,
+                         "foot_note": "NORMAL"})
+        if miss:
+            missing.append({"name": name, "herbs": miss})
+            continue
+        if not rows:
+            continue
+        tid = template_create(ctx, {
+            "name": name, "template_type": "HERB", "scope": "CLINIC",
+            "category": "经典方", "indication": indication, "syndrome_name": syndrome,
+            "doses_default": config.get_int("herb.default_doses", 7),
+            "decoction_method": "水煎", "administration": "每日一剂，分两次温服",
+            "items": rows,
+        }, q)["id"]
+        created.append({"id": tid, "name": name, "count": len(rows)})
+    return {"created": created, "skipped_exist": skipped_exist, "missing": missing,
+            "total": len(created)}
 
 
 # ---------- 对外服务接口（跨模块调用入口）----------
@@ -1376,9 +1562,10 @@ def catalog_frequent(ctx, body, q):
 @route("/api/catalog/cleanup_test", "POST", perm="herb.manage", module="M06",
        action="catalog.cleanup_test")
 def catalog_cleanup_test(ctx, body, q):
-    """把自动化测试造出来的品目停用掉，避免它们混进开方候选里。
+    """把自动化测试造出来的品目与模板停用掉，避免它们混进开方候选和经典方列表里。
 
-    特征是名称形如 "M06黄芪" / "M07饮片" / "M10饮片B"（模块号 + 品类名）。
+    特征是名称形如 "M06黄芪" / "M07饮片" / "M10饮片B"（模块号 + 品类名），
+    模板名形如 "M06新建模板1026198583"。
     只置 is_active=0（软停用），不删数据 —— 随时可再启用，不做不可逆操作。
     """
     pats = ("M0%", "M1%")
@@ -1404,6 +1591,16 @@ def catalog_cleanup_test(ctx, body, q):
                                  "WHERE id=?", (now, ctx.user_id, r["id"]))
                 n += 1
         out["drug"] = n
+        n = 0
+        for p in pats:
+            rows = db.execute(conn, "SELECT id, name FROM prescription_template "
+                                    "WHERE deleted_at IS NULL AND is_active=1 "
+                                    "AND name LIKE ?", (p,)).fetchall()
+            for r in rows:
+                db.execute(conn, "UPDATE prescription_template SET is_active=0, updated_at=?, "
+                                 "updated_by=? WHERE id=?", (now, ctx.user_id, r["id"]))
+                n += 1
+        out["template"] = n
     return out
 
 

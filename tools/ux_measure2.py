@@ -73,6 +73,17 @@ class UI:
         _add("click")
         return r
 
+    def click_match(self, kw, tag="button", wait=0.9):
+        """按包含关系点按钮（按钮文案带括号说明时用这个）"""
+        r = self.b.js("(function(){var els=Array.from(document.querySelectorAll(%s));"
+                      "var e=els.find(function(x){return (x.innerText||'').indexOf(%s)>=0});"
+                      "if(!e)return 'no-el';if(e.disabled)return 'disabled';"
+                      "e.scrollIntoView({block:'center'});e.click();return 'ok'})()"
+                      % (json.dumps(tag), json.dumps(kw)))
+        self.b.drain(wait)
+        _add("click")
+        return r
+
     def click_chip(self, input_id, value, wait=0.5):
         """点常用标签（舌象/脉象/证型快捷标签）"""
         r = self.b.js("(function(){var els=Array.from(document.querySelectorAll('span.btn'));"
@@ -206,14 +217,11 @@ def main():
         else:
             ok_n += 1
     say("  逐味录入 %d 味：每味「打字+回车」= 1 步 -> %d 步" % (ok_n, ok_n))
-    ui.click_text("计价")
-    ui.b.drain(1.2)
-    ui.click_text("提交")
-    ui.b.drain(1.8)
+    ui.click_match("提交", "button", 1.8)   # 提交时自动计价 + 规则预检，不再单独点计价
+    ui.b.drain(2.0)
     ui.prompt(PWD)
-    ui.click_text("确认（需口令）")
-    ui.b.drain(2.5)
-    say("  收尾：计价/提交/确认 = 3 步（确认仍需签一次口令）")
+    ui.click_match("确认", "button", 2.5)
+    say("  收尾：提交 + 确认 = 2 步（提交已自动计价与预检；确认仍需签一次口令）")
 
     # ---------- 发药 ----------
     phase("发药")

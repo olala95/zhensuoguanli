@@ -71,11 +71,21 @@ def main():
         b.js("(function(){var els=Array.from(document.querySelectorAll('button'));"
              "var e=els.find(function(x){return (x.innerText||'').trim()==='建方'});if(e)e.click();})()")
         b.drain(3.0)
-        # 敲几个字展示候选下拉
-        b.js("(function(){var e=document.querySelector('#rx_fast');if(!e)return;e.focus();"
-             "var d=Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value');"
-             "d.set.call(e,%s);e.dispatchEvent(new Event('input',{bubbles:true}));})()" % json.dumps("hq"))
-        b.drain(1.2)
+        # 复诊提速：先展开经典方面板
+        b.js("(function(){var els=Array.from(document.querySelectorAll('button'));"
+             "var e=els.find(function(x){return (x.innerText||'').indexOf('经典方')>=0});"
+             "if(e)e.click();})()")
+        b.drain(1.0)
+        # 再点「照上次方」，让明细落到表格里
+        b.js("(function(){var els=Array.from(document.querySelectorAll('button'));"
+             "var e=els.find(function(x){return (x.innerText||'').indexOf('照上次方')>=0});"
+             "if(e)e.click();})()")
+        b.drain(2.5)
+        names = b.js("(function(){var t=document.querySelector('#rx_editor table tbody');"
+                     "if(!t)return 'no-table';"
+                     "return Array.from(t.querySelectorAll('tr')).map(function(r){"
+                     "return r.cells[1]?r.cells[1].innerText.trim():'';}).join('、')})()")
+        say("照上次方后明细：" + str(names)[:200])
         p = os.path.join(TMP, "ux_prescribe.png")
         b.screenshot(p); shots.append(p)
         say("prescribe -> " + p)

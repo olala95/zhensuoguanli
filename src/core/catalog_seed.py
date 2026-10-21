@@ -45,6 +45,9 @@ _HERB_ROWS = """
 北沙参|beishashen|bss|0.06|12|
 南沙参|nanshashen|nss|0.05|12|
 玉竹|yuzhu|yz|0.04|12|
+淡竹叶|danzhuye|dzy|0.02|10|
+芦根|lugen|lg|0.02|15|
+白扁豆|baibiandou|bbd|0.03|12|
 百合|baihe|bh|0.05|12|
 石斛|shihu|sh|0.20|12|
 黄精|huangjing|hj|0.06|15|
