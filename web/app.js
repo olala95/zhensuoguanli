@@ -340,9 +340,11 @@ async function fillBillSelect(selId, visitId) {
   try {
     const items = (await api('/api/finance/bills', { visit_id: visitId, limit: 20 }, 'GET')).items || [];
     if (!items.length) { el.innerHTML = '<option value="">该就诊没有账单</option>'; return; }
+    // 自动选中待收的那张（否则下拉停在空值，从工作台点「收费」进来还要再选一次）
+    const pick = items.find(b => b.status === 'PENDING' || b.status === 'PARTIAL_PAID') || items[0];
     el.innerHTML = '<option value="">— 选择账单 —</option>' + items.map(b => {
       const label = [b.bill_no, b.status, yuan(b.total_amount_fen) + '元'].filter(Boolean).join(' · ');
-      return `<option value="${b.id}">${esc(label)}</option>`;
+      return `<option value="${b.id}"${b.id === pick.id ? ' selected' : ''}>${esc(label)}</option>`;
     }).join('');
   } catch (e) {
     el.innerHTML = '<option value="">读取失败</option>';
